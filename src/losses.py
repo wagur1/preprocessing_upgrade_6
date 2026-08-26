@@ -1,0 +1,163 @@
+"""Training objective for the machine-vision video preprocessor (upgrade2).
+
+    L = lam_task * L_task + omega * L_distill + beta * L_rate + tau * L_temp
+        (+ delta * L_delta) (+ gamma * L_tv) (+ mu * L_D)
+
+By default there is **no MSE-to-source distortion term**. That term (the
+baseline's ``L_D``) pins the reconstruction to the original pixels; against a
+codec-*mismatched* proxy (our CompressAI wavelet transform) it fought
+compression, which is why that setup never reached negative BD-Rate. Following
+Yang et al. (TCSVT 2024) the default objective replaces pixel fidelity with a
+*task-aligned* feature distillation term and lets a real rate weight bite.
+
+Zhao et al. (arXiv:2512.15331), however, KEEP ``L_D`` heavily weighted (alpha=10)
+with a light rate weight and still win on real block-DCT codecs. So ``L_D`` is
+available as an optional ``mu`` term -- enable it together with the
+block-transform virtual codec (``codec.kind: virtual``), where pinning pixels is
+in the *same* domain as x264/x265 rather than fighting a wavelet proxy.
+
+  * ``L_task``   : accuracy loss from the frozen analyzer on the reconstruction
+                   (cross-entropy for recognition; SiamFC logistic for tracking).
+  * ``L_distill``: MSE between the frozen analyzer's intermediate features on the
+                   *source* and on the *reconstruction* -- keeps semantics the
+                   codec would otherwise destroy (helps most at low bitrate).
+  * ``L_rate``   : estimated bits-per-pixel from the codec entropy model.
+  * ``L_temp``   : temporal consistency -- match the *inter-frame change* of the
+                   reconstruction to that of the source. Preserves motion / kills
+                   flicker without pinning absolute pixels (the video novelty).
+  * ``L_delta``  : (optional, off by default) L1 magnitude of the preprocessor's
+                   pixel edit ``|x_pre - x|``. A direct edit-sparsity lever when
+                   the rate term alone won't stop the edit adding bits. NOT
+                   MSE-to-source: it constrains the *input* edit, not x_hat.
+  * ``L_tv``     : (optional, off by default) total variation of the preprocessor
+                   output ``x_pre``. A *codec-agnostic* bit-cost proxy: every real
+                   codec (DCT/wavelet/block) spends bits on spatial high-frequency
+                   energy, so penalising TV pushes cheap-to-encode-on-ANY-codec
+                   frames -- the lever for transfer to x264/x265 (unlike beta*bpp,
+                   which only reduces the *proxy* codec's bits). L_task keeps the
+                   edges the machine actually needs.
+  * ``L_D``      : (optional, off by default) MSE between reconstruction and
+                   source ``||x_hat - x||^2``. Zhao et al.'s distortion term; use
+                   it with the block-transform virtual codec (mu ~ 10, light beta).
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Dict
+
+import torch
+import torch.nn.functional as F
+
+
+@dataclass
+class LossWeights:
+    lam_task: float = 1.0
+    omega: float = 0.5   # feature distillation (Yang et al. use 0.5)
+    beta: float = 0.1    # rate; raise until bpp actually bites
+    tau: float = 0.1     # temporal consistency
+    delta: float = 0.0   # L1 edit-magnitude |x_pre-x| (edit sparsity; 0 = off)
+    gamma: float = 0.0   # total-variation of x_pre (codec-agnostic bit cost; 0 = off)
+    mu: float = 0.0      # MSE-to-source L_D (paper's distortion term; 0 = off)
+    use_task_mask: bool = False  # A2: weight gamma/delta by task saliency (spatial)
+
+
+def total_variation(x: torch.Tensor) -> torch.Tensor:
+    """Mean spatial total variation of x (last two dims are H, W).
+
+    Codec-agnostic proxy for encode cost: sum of |neighbour pixel differences|.
+    Works for 4D (B,C,H,W) and 5D (B,C,T,H,W) tensors alike."""
+    dh = (x[..., 1:, :] - x[..., :-1, :]).abs().mean()
+    dw = (x[..., :, 1:] - x[..., :, :-1]).abs().mean()
+    return dh + dw
+
+
+
+def feature_distillation(analyzer, x_source: torch.Tensor, x_hat: torch.Tensor) -> torch.Tensor:
+    """Scale-normalised MSE between frozen-analyzer features of source vs recon.
+
+    Source features are the (detached) target; gradients flow only through the
+    reconstruction path. Returns 0 if the analyzer exposes no features."""
+    feats_src = analyzer.features(x_source)
+    feats_hat = analyzer.features(x_hat)
+    if not feats_src:
+        return x_hat.new_zeros(())
+    loss = x_hat.new_zeros(())
+    for fs, fh in zip(feats_src, feats_hat):
+        fs = fs.detach()
+        loss = loss + F.mse_loss(fh, fs) / (fs.pow(2).mean() + 1e-6)
+    return loss / len(feats_src)
+
+
+def temporal_consistency(x_source: torch.Tensor, x_hat: torch.Tensor) -> torch.Tensor:
+    """Match reconstruction inter-frame deltas to source inter-frame deltas."""
+    if x_source.shape[2] < 2:
+        return x_hat.new_zeros(())
+    ds = x_source[:, :, 1:] - x_source[:, :, :-1]
+    dh = x_hat[:, :, 1:] - x_hat[:, :, :-1]
+    return F.mse_loss(dh, ds)
+
+
+def preprocessing_loss(
+    analyzer,
+    x_source: torch.Tensor,
+    x_hat: torch.Tensor,
+    bpp: torch.Tensor,
+    target: Any,
+    w: LossWeights,
+    x_pre: torch.Tensor | None = None,
+    task_mask: torch.Tensor | None = None,
+) -> Dict[str, torch.Tensor]:
+    """Composite preprocessor loss.
+
+    ``task_mask`` (A2): optional detached ``[B,1,T,H,W]`` importance map in [0,1]
+    (1 = task-critical). When given, the edit (``delta``) and TV (``gamma``)
+    penalties are weighted by ``1-mask`` so the preprocessor smooths / stops
+    spending bits on *background* while sparing the object the analyzer needs.
+    Without a mask the penalties are spatially uniform (upgrade2 behaviour).
+    """
+    from .models.task_mask import masked_tv
+
+    l_task, _ = analyzer.accuracy_loss(x_hat, target)
+    l_dist = feature_distillation(analyzer, x_source, x_hat)
+    l_temp = temporal_consistency(x_source, x_hat)
+    total = w.lam_task * l_task + w.omega * l_dist + w.beta * bpp + w.tau * l_temp
+    bg = (1.0 - task_mask) if task_mask is not None else None  # penalise background
+    # Edit-magnitude penalty on the *preprocessor output* (not the reconstruction):
+    # pushes small/sparse pixel edits so the codec has less added detail to encode.
+    # Distinct from MSE-to-source (which pins x_hat and fights compression).
+    if w.delta and x_pre is not None:
+        edit = (x_pre - x_source).abs()
+        l_delta = (edit * bg).mean() if bg is not None else edit.mean()
+        total = total + w.delta * l_delta
+    else:
+        l_delta = x_hat.new_zeros(())
+    # Codec-agnostic bit-cost: penalise spatial high-frequency energy of the
+    # output so edits are cheap on ANY codec (targets x264/x265 transfer, which
+    # beta*bpp -- the proxy codec's own rate -- does not reach). With a task mask
+    # the penalty is SPATIAL: smooth background hard, spare the object (A2).
+    if w.gamma and x_pre is not None:
+        l_tv = masked_tv(x_pre, bg) if bg is not None else total_variation(x_pre)
+        total = total + w.gamma * l_tv
+    else:
+        l_tv = x_hat.new_zeros(())
+    # MSE-to-source L_D (Zhao et al.): pins the reconstruction to the source.
+    # We dropped it originally because it fought compression -- but that was
+    # against a mismatched (wavelet) proxy. The paper KEEPS it heavy (alpha=10)
+    # with a light rate weight and still wins on real block-DCT codecs, so it is
+    # available here; enable it together with the block-transform virtual codec.
+    if w.mu:
+        l_d = F.mse_loss(x_hat, x_source)
+        total = total + w.mu * l_d
+    else:
+        l_d = x_hat.new_zeros(())
+    return {
+        "loss": total,
+        "loss_task": l_task.detach(),
+        "loss_dist": l_dist.detach(),
+        "loss_rate": (bpp.detach() if torch.is_tensor(bpp) else torch.as_tensor(bpp)),
+        "loss_temp": l_temp.detach(),
+        "loss_delta": l_delta.detach(),
+        "loss_tv": l_tv.detach(),
+        "loss_d": l_d.detach(),
+    }

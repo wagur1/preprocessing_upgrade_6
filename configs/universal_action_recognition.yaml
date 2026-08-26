@@ -1,0 +1,91 @@
+# =============================================================================
+# UPGRADE-3 headline config: Universal analyzer-agnostic video preprocessing
+# for machines, before a FROZEN standard codec (x264/x265).
+#
+# Contributions wired here (see README.md / docs/MODEL.md):
+#   A1  multi-teacher panel + HELD-OUT analyzer generalisation
+#   A2  task-importance spatial mask steering the edit/TV penalty
+#   A3  real-codec calibration: soft->hard quant anneal (+ optional STE stage 2)
+#
+# Only the preprocessor is trained; every teacher AND the codec are frozen.
+# =============================================================================
+
+device: auto
+out_dir: outputs
+seed: 0
+
+task:
+  name: action_recognition
+  clip_size: 112
+  # ---- A1: the frozen TEACHER PANEL the preprocessor trains against ----------
+  # >1 backbone => MultiTeacherAnalyzer. "sample" draws one teacher/step (~1x
+  # analyzer cost, acts as a regulariser); "mean" averages all (Nx cost, stable).
+  teachers: [r3d_18, mc3_18]        # Kinetics-400 video ResNets
+  teacher_sampling: sample          # sample | mean
+  # teacher_weights: [1.0, 1.0]     # optional per-teacher loss weights
+  backbone: r3d_18                  # fallback single backbone (if teachers unset)
+
+model:
+  base_ch: 32
+  res_scale: 1.0
+  max_relative_edit: 0.25  # hard safety envelope: one pass cannot erase the clip
+  cond_dim: 1
+  qp_ref: [20, 51]
+
+codec:                              # differentiable TRAINING proxy
+  kind: virtual                     # virtual (block-DCT, matched to x26x) | compressai | ste
+  qualities: [1, 2, 3, 5, 8]
+  block: 8
+  inter: true
+  closed_loop: false             # set true to train with reconstructed P-frame references
+  step_coarse: 3.0                  # coarsest quant step (fewest bits)
+  step_fine: 1.0                    # finest quant step (most bits)
+  anneal: 1.0                       # A3: ramp soft(noise)->hard(round) quant over training (0=off)
+  # ---- stage-2 STE calibration (set kind: ste) -------------------------------
+  # ste_codec: both                 # h264 | h265 | both (sample per train step)
+  # ste_eval_codec: h265            # deterministic eval codec when using both
+  # ste_preset: medium
+
+data:
+  index: data/index/kinetics_3gb.json
+  num_frames: 16
+  frame_size: 128
+  temporal_stride: 2
+
+loss:   # L = lam_task*L_task + omega*L_distill + beta*bpp + tau*L_temp + delta*|x_pre-x| + gamma*TV(+mask) + mu*L_D
+  lam_task: 1.0
+  omega: 0.5              # frozen-teacher feature distillation (Yang et al. 2024)
+  # Paper-style virtual-codec balance. The previous mu=0 objective had a trivial
+  # solution: erase the clip, obtain near-zero bpp, and lose all task accuracy.
+  beta: 0.01
+  tau: 0.1              # temporal consistency
+  delta: 0.02            # A2: masked L1 edit magnitude (background only)
+  gamma: 0.01            # conservative masked background smoothing
+  mu: 10.0               # L_D is required with the block-DCT/STE path to prevent erasure
+  use_task_mask: true    # A2: weight delta/gamma by frozen-teacher saliency
+
+train:
+  epochs: 5
+  max_steps: null        # cap steps for quick Kaggle runs (e.g. 300)
+  reg_warmup_frac: 0.5   # let task/distillation establish a useful basin before smoothing bites
+  qp_per_step: 1         # set 3 to optimise several RD points per update
+  batch_size: 4
+  num_workers: 2
+  lr: 1.0e-4
+  qp_list: [22, 27, 32, 37, 42]                        # REVERTED: [30-50] made training collapse (all-blank, acc=0). Wider range keeps high-quality points that keep L_task alive.
+  qp_to_quality: {22: 5, 27: 3, 32: 2, 37: 1, 42: 1}   # ponytail: mild qp45/50 eval extrapolation is the lesser evil vs collapse
+  cosine: true
+  patience: 5
+  min_delta: 1.0e-4
+  val_max_batches: 20
+  resume: false
+  finetune: false
+
+eval:
+  split: test
+  batch_size: 4
+  num_workers: 2
+  # ---- A1: generalisation test -- a backbone NOT in task.teachers ------------
+  held_out_backbone: r2plus1d_18    # set null to evaluate in-domain (r3d_18) instead
+  qp_list: [30, 35, 40, 45, 50]     # x264/x265 anchor QPs (paper range)
+  preset: medium

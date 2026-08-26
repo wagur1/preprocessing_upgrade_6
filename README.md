@@ -99,3 +99,12 @@ CLI xử lý một thư mục frame: `vcm-preprocess frames/ frames_pp/ --config
 ```bash
 python -m pytest -q
 ```
+
+## Recipe khuyến nghị để tối ưu transfer
+
+`configs/robust_transfer.yaml` là preset cho đường cong RD ổn định hơn: proxy
+block-DCT dùng closed-loop P-frame references, `qp_per_step=3` tối ưu đồng thời
+nhiều operating points, và loss giữ task-mask + TV. Sau stage 1, có thể fine-tune
+STE với `codec.kind=ste codec.ste_codec=both codec.ste_eval_codec=h265` để lấy mẫu
+H.264/H.265 trong forward; khi đánh giá nên chạy riêng `ste_eval_codec=h264` và
+`h265` để báo cáo hai anchor cùng protocol.
