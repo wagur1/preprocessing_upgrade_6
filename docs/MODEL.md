@@ -68,13 +68,22 @@ Matches x264/x265 **geometry** (the prime suspect for upgrade-2's poor transfer,
 where CompressAI's learned wavelet transform did not):
 
 ```
-P-frame residual r  (pred = previous SOURCE frame; frame 0 = intra)
+[C1, default]  RGB ─► BT.601 YCbCr ─► chroma 2×2 downsample
+  P-frame residual per plane (pred = previous RECONSTRUCTED plane; frame 0 = intra)
   r ─► block DCT (bs×bs orthonormal) ─► coeffs
-  coeffs / step(quality) ─► y ─► quantize ─► ŷ
+  coeffs / step(quality) ─► y ─► quantize ─► ŷ        (chroma step × chroma_step_scale)
   rate = Σ 0.5·log2(1 + 12·E[y²])          (factorised per-frequency, parameter-free)
   ŷ·step ─► inverse block DCT ─► r̂ ─► x̂ = pred + r̂
+  chroma upsample ─► YCbCr → RGB
 ```
 
+* **C1 yuv420 colourspace (5.1 default).** Every `-pix_fmt yuv420p` encode halves
+  chroma resolution at *any* QP and quantises chroma coarser (the H.26x chroma QP
+  offset ≈ +6 QP at QP50, `chroma_step_scale=2.0`). The proxy reproduces this
+  geometry with differentiable ops (`src/models/color.py`), so the training
+  rate/distortion gradients match the deployment codec's colourspace damage —
+  chroma-heavy edits finally cost what the real codec charges. `colorspace: rgb`
+  keeps the legacy single-plane path for ablation.
 * **Quantizer step** is the rate knob: higher `quality` id → finer step → more
   bits. Steps geometrically interpolate `step_coarse → step_fine` across ids, or
   are set explicitly via `q_steps` (physical calibration to overlap the x264/x265

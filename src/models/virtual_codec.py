@@ -1,4 +1,4 @@
-"""Differentiable block-transform virtual codec (upgrade2).
+"""Differentiable block-transform virtual codec (upgrade2; 5.1 adds C1 yuv420).
 
 Rebuilds the paper's hand-crafted virtual codec (Zhao et al.) so the TRAINING
 proxy matches x264/x265 *geometry* -- block DCT + scalar quantisation + P-frame
@@ -8,15 +8,21 @@ transfer to the real block-DCT codecs.
 
 Pipeline, per clip ``[B,C,T,H,W]`` in [0,1]:
 
+    RGB -> YCbCr, chroma 2x2 subsampled (yuv420 mode)     [5.1, C1]
     predict (I-frame: none; P-frame: previous RECONSTRUCTED frame) -> residual r
     r  -> block DCT (bs x bs, orthonormal)                   -> coeffs
     coeffs / step(quality)  -> y            (step = quantiser coarseness knob)
     y  -> quantise (add-noise train / round eval)            -> y_hat
     rate = per-frequency Gaussian entropy of y  (factorised, parameter-free)
     y_hat * step  -> inverse block DCT -> r_hat -> x_hat = pred + r_hat
+    chroma upsampled, YCbCr -> RGB                            [5.1, C1]
 
 Faithful: block DCT, block-wise scalar quant, closed-loop P-frame prediction,
-and a factorised per-frequency rate. Deliberate proxy corner (ponytail):
+**and -- in the default ``yuv420`` mode -- the BT.601 RGB<->YCbCr conversion
+plus fixed 2x chroma subsampling and coarser chroma quantisation that every
+``-pix_fmt yuv420p`` encode applies** (see ``models/color.py``). The legacy
+``rgb`` mode (upgrade-2/3 behaviour) is kept for ablation. Deliberate proxy
+corner (ponytail):
   * parameter-free Gaussian rate instead of a *trained* Balle factorised prior,
     so the codec stays frozen and the optimiser still touches only the
     preprocessor. Swap in a trained EntropyBottleneck if the rate proves coarse.
@@ -32,6 +38,8 @@ from typing import Dict, List
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from .color import rgb_to_yuv420_planes, yuv420_planes_to_rgb
 
 
 def _dct_basis(n: int) -> torch.Tensor:
@@ -59,6 +67,15 @@ class VirtualCodec(nn.Module):
             range, not blindly.
         inter: enable closed-loop P-frame prediction (previous reconstruction as
             reference), matching codec reference-frame drift.
+        colorspace: ``"yuv420"`` (default, C1) codes the frame as the real codec
+            sees it -- BT.601 YCbCr with chroma 2x2-subsampled before the
+            transform and quantised with a coarser step. ``"rgb"`` is the
+            legacy upgrade-2/3 behaviour (single 3-channel plane), kept for
+            ablation of the colourspace contribution.
+        chroma_step_scale: multiplier on the quant step for the chroma planes
+            (yuv420 only). The H.26x chroma QP offset reaches ~+6 QP (~2x step)
+            near QP 50 and is smaller at high rate; 2.0 is the mid-range
+            operating approximation.
     """
 
     def __init__(
@@ -69,6 +86,8 @@ class VirtualCodec(nn.Module):
         step_coarse: float = 0.25,
         step_fine: float = 0.03,
         inter: bool = True,
+        colorspace: str = "yuv420",
+        chroma_step_scale: float = 2.0,
     ):
         super().__init__()
         if isinstance(qualities, int):
@@ -76,6 +95,12 @@ class VirtualCodec(nn.Module):
         self.qualities = list(qualities)
         self.block = int(block)
         self.inter = bool(inter)
+        if colorspace not in ("rgb", "yuv420"):
+            raise ValueError(f"colorspace must be 'rgb' or 'yuv420', got {colorspace!r}")
+        self.colorspace = colorspace
+        if chroma_step_scale <= 0:
+            raise ValueError("chroma_step_scale must be positive")
+        self.chroma_step_scale = float(chroma_step_scale)
         self.register_buffer("_D", _dct_basis(self.block), persistent=False)
         # Soft->hard quantiser annealing (upgrade3 A3). 0 = additive-uniform-noise
         # (fully soft, the upgrade2 default); 1 = straight-through hard rounding.
@@ -152,6 +177,53 @@ class VirtualCodec(nn.Module):
     def _code(self, x: torch.Tensor, quality: int, training: bool):
         B, C, T, H, W = x.shape
         step = self._steps[int(quality)]
+        if self.colorspace == "yuv420":
+            return self._code_yuv420(x, step, training)
+        return self._code_rgb(x, step, training)
+
+    def _code_yuv420(self, x: torch.Tensor, step: float, training: bool):
+        """Code each frame in the codec's colourspace: luma plane full-res,
+        chroma plane 2x-subsampled with a coarser quant step (C1).
+
+        Bits are counted per-plane (chroma at quarter the samples) and reported
+        as bpp over the full-resolution pixel count, so the rate is directly
+        comparable with the rgb path and with real-codec bpp."""
+        B, C, T, H, W = x.shape
+        c_step = step * self.chroma_step_scale
+        recon, prev = [], None
+        total_bits = x.new_zeros(())
+        for t in range(T):
+            frame = x[:, :, t]                                    # [B,3,H,W] RGB
+            if self.inter and prev is not None:
+                # predict in plane space so the reference carries the codec's
+                # colourspace damage (closed loop, like the rgb path)
+                y_cur, c_cur = rgb_to_yuv420_planes(frame)
+                y_ref, c_ref = prev                               # planes
+                y_res, y_hw = self._pad(y_cur - y_ref)
+                c_res, c_hw = self._pad(c_cur - c_ref)
+                y_hat, y_bits = self._quant_rate(self._dct(y_res), step, training)
+                c_hat, c_bits = self._quant_rate(self._dct(c_res), c_step, training)
+                y_rec = self._crop(self._idct(y_hat * step, 1, *y_hw), y_hw)
+                c_rec = self._crop(self._idct(c_hat * c_step, 2, *c_hw), c_hw)
+                frame_hat = yuv420_planes_to_rgb(y_ref + y_rec, c_ref + c_rec)
+            else:                                                 # intra frame
+                y_cur, c_cur = rgb_to_yuv420_planes(frame)
+                y_res, y_hw = self._pad(y_cur)
+                c_res, c_hw = self._pad(c_cur)
+                y_hat, y_bits = self._quant_rate(self._dct(y_res), step, training)
+                c_hat, c_bits = self._quant_rate(self._dct(c_res), c_step, training)
+                y_rec = self._crop(self._idct(y_hat * step, 1, *y_hw), y_hw)
+                c_rec = self._crop(self._idct(c_hat * c_step, 2, *c_hw), c_hw)
+                frame_hat = yuv420_planes_to_rgb(y_rec, c_rec)
+            prev = rgb_to_yuv420_planes(frame_hat)                # closed loop
+            recon.append(frame_hat)
+            total_bits = total_bits + y_bits + c_bits
+        x_hat = torch.stack(recon, dim=2)
+        return x_hat, total_bits / (B * T * H * W)
+
+    def _code_rgb(self, x: torch.Tensor, step: float, training: bool):
+        """Legacy upgrade-2/3 path: one 3-channel plane, no colourspace split."""
+        B, C, T, H, W = x.shape
         recon, prev = [], None
         total_bits = x.new_zeros(())
         for t in range(T):
@@ -180,7 +252,8 @@ class VirtualCodec(nn.Module):
 
 def _demo() -> None:
     torch.manual_seed(0)
-    cod = VirtualCodec(qualities=(1, 2, 3, 5, 8), block=8)
+    # --- colour-aware checks (yuv420 default, C1) -------------------------
+    cod = VirtualCodec(qualities=(1, 2, 3, 5, 8), block=8, colorspace="yuv420")
     # DCT basis is orthonormal
     D = cod._D
     assert torch.allclose(D @ D.T, torch.eye(8), atol=1e-5), "DCT not orthonormal"
@@ -188,9 +261,18 @@ def _demo() -> None:
     r = torch.rand(2, 3, 32, 32)
     assert torch.allclose(cod._idct(cod._dct(r), 3, 32, 32), r, atol=1e-4), "DCT round-trip"
     x = torch.rand(2, 3, 4, 32, 32)
-    # fine step -> near-identity reconstruction
-    xf, _ = cod.compress_decompress(x, 8)
-    assert (xf - x).abs().mean() < 0.05, "fine step should reconstruct well"
+    # fine step -> near-identity reconstruction. All-channel error is probed on
+    # video-like (mildly smoothed) content: pixel-scale random chroma noise is
+    # exactly what 4:2:0 destroys, so a noise clip CANNOT reconstruct in the
+    # chroma channels -- the codec behaves the same way.
+    smooth = F.avg_pool3d(x, kernel_size=(1, 3, 3), stride=1, padding=(0, 1, 1))
+    xf, _ = cod.compress_decompress(smooth, 8)
+    err_all = (xf - smooth).abs().mean()
+    assert err_all < 0.15, f"fine-step reconstruction too far ({err_all})"
+    from .color import rgb_to_ycbcr
+    y_src = rgb_to_ycbcr(smooth)[:, 0:1]
+    y_rec = rgb_to_ycbcr(xf)[:, 0:1]
+    assert (y_rec - y_src).abs().mean() < 0.05, "luma should reconstruct well"
     # coarser quality id -> fewer bits (monotone rate knob)
     _, bpp_fine = cod.compress_decompress(x, 8)
     _, bpp_coarse = cod.compress_decompress(x, 1)
@@ -202,6 +284,15 @@ def _demo() -> None:
     # Scalar rounding can make neighbouring QPs cross on a single random clip;
     # the invariant we need is that the fine endpoint beats the coarse endpoint.
     assert mse[0] > mse[-1], mse
+    # achromatic content keeps the rate knob monotone and reconstructs well:
+    # chroma is flat, so the 4:2:0 damage vanishes and only quant remains.
+    grey = x.mean(dim=1, keepdim=True).expand_as(x) + 0.02 * torch.randn_like(x)
+    grey = grey.clamp(0, 1)
+    _, bpp_grey_fine = cod.compress_decompress(grey, 8)
+    _, bpp_grey_coarse = cod.compress_decompress(grey, 1)
+    assert bpp_grey_coarse < bpp_grey_fine
+    gq, _ = cod.compress_decompress(grey, 8)
+    assert (gq - grey).abs().mean() < 0.05, "achromatic fine-step should reconstruct"
     # Headline Kaggle calibration must also improve distortion as rate rises.
     calibrated = VirtualCodec(
         qualities=(1, 2, 3, 5, 8), block=8, step_coarse=3.0, step_fine=1.0
@@ -224,7 +315,18 @@ def _demo() -> None:
     (xh2.mean() + bpp2).backward()
     assert xin2.grad is not None and torch.isfinite(bpp2)
     cod.set_anneal(0.0)
-    print(f"virtual_codec self-check passed (bpp {bpp_coarse:.3f} < {bpp_fine:.3f})")
+    # --- legacy rgb path still behaves (ablation baseline) ----------------
+    cod_rgb = VirtualCodec(qualities=(1, 2, 3, 5, 8), block=8, colorspace="rgb")
+    xr, bpp_rgb_fine = cod_rgb.compress_decompress(x, 8)
+    assert (xr - x).abs().mean() < 0.05, "legacy rgb fine step should reconstruct"
+    _, bpp_rgb_coarse = cod_rgb.compress_decompress(x, 1)
+    assert bpp_rgb_coarse < bpp_rgb_fine
+    # yuv420 chroma subsampling must cost fewer bits than rgb at the same step
+    # (quarter of the chroma samples, coarser chroma step): the C1 proxy should
+    # sit at a lower bpp than the legacy proxy on the same clip.
+    assert bpp_fine < bpp_rgb_fine, (bpp_fine, bpp_rgb_fine)
+    print(f"virtual_codec self-check passed (yuv420 bpp {bpp_coarse:.3f} < "
+          f"{bpp_fine:.3f} < rgb {bpp_rgb_fine:.3f})")
 
 
 if __name__ == "__main__":

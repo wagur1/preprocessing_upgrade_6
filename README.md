@@ -1,4 +1,4 @@
-# pre_processing_upgrade_3
+# preprocessing_upgrade_5.1
 
 **Universal, analyzer-agnostic video preprocessing for Video Coding for Machines (VCM), in front of a *frozen* standard codec (x264 / x265).**
 
@@ -7,20 +7,21 @@ vision model ("analyzer") stay frozen and standard — no bitstream changes, no
 decoder changes, no per-CTU QP maps. The preprocessor edits pixels *before*
 encoding so that, at the same bitrate, a machine still sees what it needs.
 
-> 🇻🇳 **Tóm tắt.** Đây là bản nâng cấp 3 của pipeline tiền xử lý VCM. Chỉ huấn
+> 🇻🇳 **Tóm tắt.** Đây là bản nâng cấp 5.1 của pipeline tiền xử lý VCM. Chỉ huấn
 > luyện *preprocessor* đặt **trước** một codec tiêu chuẩn (x264/x265) **đóng
-> băng**; codec và mạng phân tích (analyzer) không đổi. Ba đóng góp mới so với
-> upgrade2: **(A1)** preprocessor *phổ quát* học từ một *hội đồng nhiều teacher*
-> và được kiểm chứng trên analyzer **chưa từng thấy** (held-out); **(A2)** *mặt nạ
-> tầm quan trọng theo tác vụ* để dồn bit vào vùng máy cần; **(A3)** *hiệu chỉnh
-> theo codec thật* (chạy codec thật trong forward + gradient qua proxy, cùng
-> annealing lượng tử mềm→cứng). Hướng dẫn chạy trên Kaggle: [`docs/KAGGLE.md`](docs/KAGGLE.md).
+> băng**; codec và mạng phân tích (analyzer) không đổi. So với upgrade-3 (A1
+> multi-teacher, A2 task-mask, A3 STE real-codec calibration — giữ nguyên),
+> bản 5.1 thêm hai đóng góp nhắm thẳng vào khoảng cách proxy→codec-thật còn
+> lại: **(C1)** proxy codec mô phỏng đúng **colorspace YCbCr 4:2:0** của
+> x264/x265 (BT.601 + subsample chroma 2× + lượng tử chroma thô hơn) và
+> **(C2)** **in-grid QP protocol** — train đúng các điểm QP đánh giá
+> [30, 35, 40, 45, 50]. Hướng dẫn chạy trên Kaggle: [`docs/KAGGLE.md`](docs/KAGGLE.md).
 
 ```
                      (trained)              (FROZEN)                 (FROZEN panel)
  video x ─► Preprocessor θ ─► x_pre ─► Standard codec ─► x̂ ─► Analyzer(s) ─► machine label
             U-Net + FiLM(rate)          x264 / x265                r3d_18 / mc3_18 / …
-            + SFT(motion)               (proxy at train time)      + a HELD-OUT analyzer at eval
+            + SFT(motion)               (yuv420 proxy at train)    + a HELD-OUT analyzer at eval
             + task-mask (A2)
 ```
 
@@ -52,7 +53,19 @@ diagnosed three ceilings:
 | Bit/edit budget spent **uniformly** → cutting background also blurs the object | **A2** task-importance spatial mask |
 | Trained **entirely** through a mismatched proxy → poor transfer to real x26x | **A3** real-codec-in-the-loop calibration + soft→hard quant anneal |
 
-## The three contributions
+## Why upgrade-5.1 (what was still limiting upgrade-3)
+
+The measured upgrade-3 result (1000-step STE run, seed 0, held-out analyzer):
+`prep+h264 −1.61 %`, `prep+h265 −0.27 %` BD-Rate — transfer turned negative
+but remained an order of magnitude short of the paper's −12…−19 %. Two
+signatures in the rate-accuracy curves motivated the two 5.1 contributions:
+
+| Remaining limitation in upgrade-3 | Fixed in 5.1 by |
+|---|---|
+| Proxy codes **RGB planes**; real codecs code **YCbCr 4:2:0** — chroma is halved at *every* QP and quantised coarser, so the training rate-gradient under-charges chroma-heavy edits and never rewards moving budget to luma | **C1** yuv420 colourspace proxy (`src/models/color.py`, `VirtualCodec(colorspace="yuv420")`) |
+| FiLM conditions extrapolated at heavy QPs (train grid ≠ eval grid; `prep+h265` accuracy *collapsed* at QP50) | **C2** in-grid QP protocol: train exactly on the eval QPs `[30, 35, 40, 45, 50]` |
+
+## The three upgrade-3 contributions
 
 ### A1 — Universal, analyzer-agnostic preprocessor (headline)
 `src/tasks/multi_teacher.py`, `src/tasks/base.py::build_analyzer`
@@ -112,6 +125,37 @@ The block-DCT proxy geometry itself (vs a learned wavelet proxy) follows Zhao et
 straight-through idea traces to **DPP** (Chadha & Andreopoulos, CVPR 2021) and the
 differentiable-JPEG proxy of **Talebi et al.** ("Better Compression with Deep
 Pre-Editing," IEEE TIP 2021).
+
+## The two upgrade-5.1 contributions
+
+### C1 — yuv420 colourspace proxy (the colourspace gap STE cannot close)
+`src/models/color.py`, `src/models/virtual_codec.py`
+
+STE corrects the *value* the loss sees, but the gradient still flows through the
+proxy — wrong geometry still gives a wrong direction. x264/x265 never code RGB:
+they convert to BT.601 YCbCr, subsample chroma 2×2 (**at every QP**, independent
+of rate), and quantise chroma coarser (the H.26x chroma QP offset ≈ +6 QP at
+QP50). An RGB proxy therefore under-charges chroma-heavy edits: the
+preprocessor keeps spending budget on chroma detail the real codec destroys for
+free. The 5.1 virtual codec reproduces the whole geometry —
+
+```
+RGB ─► BT.601 YCbCr ─► chroma 2×2 down ─► per-plane DCT+quant (chroma_step× coarser)
+  ─► chroma upsample ─► YCbCr → RGB
+```
+
+— as differentiable ops, so the training rate/distortion gradients finally
+match the deployment codec's colourspace damage. `colorspace: rgb` keeps the
+legacy path for the ablation table.
+
+### C2 — in-grid QP protocol
+`configs/*.yaml` (`train.qp_list = eval.qp_list = [30, 35, 40, 45, 50]`)
+
+The FiLM rate-conditioning is only trained on the QPs it sees; eval QPs outside
+the training grid are extrapolations (the upgrade-3 `prep+h265` accuracy
+*collapse at QP50* is the visible symptom). 5.1 trains on exactly the eval grid
+with five distinct proxy qualities — the paper's own QP range — removing the gap
+at zero cost.
 
 ---
 

@@ -1,4 +1,4 @@
-# IMPROVEMENTS.md — delta vs. baseline & upgrade-2, with citations
+# IMPROVEMENTS.md — delta vs. baseline, upgrade-2 & upgrade-3, with citations
 
 This document records **what changed and why**, mapped to the literature. It is the
 paper-facing companion to `docs/MODEL.md` (architecture) and `README.md` (overview).
@@ -13,8 +13,40 @@ The chain of work:
   BD-Rate-on-accuracy). Reached in-domain `prep+compressai` ≈ −2…−6 % with positive
   BD-accuracy, but **transfer to real x264/x265 stalled near break-even**. Report:
   `docs/bao_cao_preprocessing.md`.
-* **upgrade-3** (this repo) — three additive, backward-compatible contributions
-  (A1/A2/A3) that raise the ceiling and, critically, **transfer**.
+* **upgrade-3** — three additive, backward-compatible contributions
+  (A1/A2/A3) that raised the ceiling and turned transfer positive
+  (−1.6 % / −0.3 % BD-Rate on the 1000-step STE run) — still far from the
+  paper's −12…−19 %.
+* **upgrade-5.1** (this repo) — two further contributions aimed at the remaining
+  proxy→real gap, with the upgrade-3 measured results as motivation:
+  * **C1 yuv420 colourspace proxy** — the virtual codec now converts
+    RGB→BT.601 YCbCr, 2×2-subsamples chroma, and quantises chroma with a
+    coarser step (`chroma_step_scale`, ≈ the H.26x chroma QP offset) before
+    the transform, then reconstructs via bilinear chroma upsample — exactly
+    the geometry of every `-pix_fmt yuv420p` encode. `colorspace: rgb`
+    keeps the legacy behaviour for ablation.
+  * **C2 in-grid QP protocol** — train on exactly the eval QPs
+    `[30, 35, 40, 45, 50]` (previously `[22..42]`, leaving the heaviest
+    eval points as out-of-distribution FiLM conditions; QP50 accuracy
+    collapse in the upgrade-3 curves is the visible symptom).
+
+## 0. Why C1/C2 (evidence from the upgrade-3 run)
+
+The `qp_grid_ste1000` eval (seed 0, held-out `r2plus1d_18`, after STE stage 2)
+showed: `prep+h264 −1.61 %`, `prep+h265 −0.27 %` BD-Rate — transfer turned
+negative but tiny. Two signatures in the curves point at the two fixes:
+
+1. **At QP50** (a training-distribution extrapolation point even in the
+   in-grid run for the FiLM condition ranges trained at quality 1), `prep+h265`
+   accuracy *dropped* below bare h265 (0.077 vs 0.111) — conditioning
+   extrapolation failure. C2 + per-QP distinct qualities (already in the
+   universal config) address this.
+2. **At every QP**, the preprocessor's bpp ≈ the anchor's bpp and accuracy
+   deltas are <0.01: the edit is nearly a no-op for the *real* codec. The RGB
+   proxy lets the preprocessor "spend" budget on chroma high-frequency that
+   yuv420 destroys for free — the training signal never rewards moving that
+   budget to luma. C1 makes the proxy charge for it, exactly as the real
+   codec does.
 
 ## 1. The three ceilings of upgrade-2, and their fixes
 
@@ -29,14 +61,15 @@ The chain of work:
 | File | upgrade-2 | upgrade-3 change | contribution |
 |---|---|---|---|
 | `src/models/preprocessor.py` | U-Net + FiLM(rate) + SFT(motion), zero-init identity | *unchanged* (already the redesigned editor) | — |
-| `src/models/virtual_codec.py` | block-DCT proxy, additive-noise quantizer only | `+ _anneal` buffer, `set_anneal()`, soft→hard STE blend in `_quant_rate` | A3 |
+| `src/models/color.py` | *absent* | **new (5.1)** — BT.601 matrix, 4:2:0 plane split/join, roundtrip | C1 |
+| `src/models/virtual_codec.py` | block-DCT proxy, additive-noise quantizer only | `+ _anneal` buffer, `set_anneal()`, soft→hard STE blend in `_quant_rate`; **5.1:** `colorspace="yuv420"` dual-plane coding with `chroma_step_scale` (rgb legacy kept) | A3, C1 |
 | `src/models/ste_codec.py` | *absent* | **new** — real x264/x265 forward, proxy backward; eval real path | A3 |
 | `src/models/task_mask.py` | *absent* | **new** — `task_saliency` + `masked_tv` | A2 |
 | `src/tasks/multi_teacher.py` | *absent* | **new** — frozen-teacher panel, sample/mean | A1 |
 | `src/tasks/base.py` | `build_task` only | `+ backbone=` override, `+ build_analyzer(role=)` | A1 |
 | `src/losses.py` | fixed weights, global TV/L1 | `+ use_task_mask`, `x_pre`/`task_mask` args, `(1−m)`-weighted `δ`/`γ` | A2 |
-| `src/engine.py` | proxy-only train, single analyzer | `+ STECodec` wiring, `+ task_saliency` per step, `+ anneal` ramp, `role`-aware build | A1/A2/A3 |
-| `configs/universal_action_recognition.yaml` | *absent* | **new** headline config wiring A1+A2+A3 | — |
+| `src/engine.py` | proxy-only train, single analyzer | `+ STECodec` wiring, `+ task_saliency` per step, `+ anneal` ramp, `role`-aware build; **5.1:** `colorspace`/`chroma_step_scale` plumbing | A1/A2/A3, C1 |
+| `configs/universal_action_recognition.yaml` | *absent* | **new** headline config wiring A1+A2+A3+C1+C2 | — |
 
 ## 3. Why each fix is the right one (evidence)
 
@@ -61,6 +94,28 @@ literature: Lu et al. measured **forward-real-codec −20.3 % vs −14.6 %** for
 used in both directions. `STECodec` reproduces that (real value, proxy gradient).
 Soft→hard quantizer annealing (J4D 2606.16185) additionally makes the proxy *end* at
 the real hard quantizer, so even stage-1 pretraining lands closer to deployment.
+
+**C1 — the colourspace gap STE cannot close.** STE corrects the *value* the loss
+sees (real reconstruction) but the *gradient* still flows through the proxy; if
+the proxy's geometry is wrong the direction is still wrong. The upgrade-3 run
+trained and evaluated on matching QP grids, yet the edit stayed a near-no-op on
+real codecs (bpp deltas <1 %) — consistent with a preprocessor whose rate
+gradient under-counts chroma: every yuv420 encode halves chroma resolution at
+*any* QP and quantises it coarser (the H.26x chroma QP offset, ≈ +6 QP at
+QP50), so chroma high-frequency is free to destroy and expensive to preserve.
+The yuv420 proxy makes that cost visible *during training*, steering the edit
+budget toward luma where the bits actually go. This mirrors the fidelity-first
+argument of Talebi et al.'s pre-editing (TIP 2021) — model the codec's
+degradation honestly — but at the colourspace level rather than the JPEG-DCT
+level, and is the standard geometry used by learned-codec-for-machines works
+(e.g. 2206.05650) that report −20 % BD-Rate. `colorspace: rgb` remains for the
+ablation table.
+
+**C2 — in-grid QP protocol.** FiLM conditions are only trained on the QPs in
+`train.qp_list`; any eval QP outside it is extrapolation. The collapse of
+`prep+h265` at QP50 in the upgrade-3 curves is the visible failure. Training on
+exactly `[30, 35, 40, 45, 50]` (the eval grid, and the paper's own range) with
+five *distinct* proxy qualities removes the gap at zero cost.
 
 ## 4. Expected effect & honest caveats
 

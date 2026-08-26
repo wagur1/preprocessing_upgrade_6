@@ -34,6 +34,8 @@ codec:
   # --- virtual-codec knobs (used only when kind: virtual) ---
   block: 8                # DCT block size
   inter: true             # closed-loop P-frame prediction (previous reconstruction)
+  colorspace: yuv420      # C1 (5.1): rgb | yuv420 (match -pix_fmt yuv420p)
+  chroma_step_scale: 2.0  # C1: chroma quant offset (~+6 QP at QP50)
   step_coarse: 3.0        # quant step at the LOWEST quality id (coarsest, fewest bits) -> ~0.08 bpp
   step_fine: 1.0          # quant step at the HIGHEST quality id (finest, most bits) -> ~0.4 bpp
 
@@ -60,8 +62,8 @@ train:
   batch_size: 2
   num_workers: 2
   lr: 1.0e-4
-  qp_list: [22, 27, 32, 37, 42]
-  qp_to_quality: {22: 5, 27: 3, 32: 2, 37: 1, 42: 1}   # monotonic: QP up -> quality down
+  qp_list: [30, 35, 40, 45, 50]   # C2 (5.1): in-grid protocol = eval QPs, no extrapolation gap
+  qp_to_quality: {30: 8, 35: 5, 40: 3, 45: 2, 50: 1}   # monotonic: QP up -> quality down
   cosine: true            # cosine LR decay across all training steps
   patience: 5             # early stop after N epochs w/o val-loss improvement (0 = off)
   min_delta: 1.0e-4       # min val-loss drop that counts as an improvement

@@ -89,7 +89,8 @@ def _build_models(cfg: dict, device: torch.device, role: str = "train"):
     cc = cfg["codec"]
     kind = cc.get("kind", "compressai")
     if kind in ("virtual", "ste"):
-        # block-transform proxy matched to x264/x265 geometry (Zhao et al.)
+        # block-transform proxy matched to x264/x265 geometry (Zhao et al.);
+        # 5.1 C1: default yuv420 colourspace matches -pix_fmt yuv420p.
         proxy = VirtualCodec(
             qualities=tuple(cc.get("qualities", [1, 2, 3, 5, 8])),
             block=cc.get("block", 8),
@@ -97,6 +98,8 @@ def _build_models(cfg: dict, device: torch.device, role: str = "train"):
             step_coarse=cc.get("step_coarse", 0.25),
             step_fine=cc.get("step_fine", 0.03),
             inter=cc.get("inter", True),
+            colorspace=cc.get("colorspace", "yuv420"),
+            chroma_step_scale=cc.get("chroma_step_scale", 2.0),
         ).to(device)
     else:
         proxy = CompressAICodec(

@@ -1,11 +1,14 @@
 # =============================================================================
-# UPGRADE-3 headline config: Universal analyzer-agnostic video preprocessing
+# UPGRADE-5.1 headline config: Universal analyzer-agnostic video preprocessing
 # for machines, before a FROZEN standard codec (x264/x265).
 #
-# Contributions wired here (see README.md / docs/MODEL.md):
-#   A1  multi-teacher panel + HELD-OUT analyzer generalisation
-#   A2  task-importance spatial mask steering the edit/TV penalty
-#   A3  real-codec calibration: soft->hard quant anneal (+ optional STE stage 2)
+# Contributions wired here (see README.md / docs/MODEL.md / docs/IMPROVEMENTS.md):
+#   A1  multi-teacher panel + HELD-OUT analyzer generalisation   (upgrade-3)
+#   A2  task-importance spatial mask steering the edit/TV penalty (upgrade-3)
+#   A3  real-codec calibration: soft->hard quant anneal + STE stage 2 (upgrade-3)
+#   C1  yuv420 colourspace proxy: BT.601 + 2x2 chroma subsample + chroma
+#       quant offset, matching -pix_fmt yuv420p (upgrade-5.1, DEFAULT ON)
+#   C2  in-grid QP protocol: train exactly on the eval QPs [30..50] (upgrade-5.1)
 #
 # Only the preprocessor is trained; every teacher AND the codec are frozen.
 # =============================================================================
@@ -37,6 +40,8 @@ codec:                              # differentiable TRAINING proxy
   qualities: [1, 2, 3, 5, 8]
   block: 8
   inter: true
+  colorspace: yuv420                # C1: rgb | yuv420 (match -pix_fmt yuv420p)
+  chroma_step_scale: 2.0            # C1: chroma quant offset (~+6 QP at QP50)
   step_coarse: 3.0                  # coarsest quant step (fewest bits)
   step_fine: 1.0                    # finest quant step (most bits)
   anneal: 1.0                       # A3: ramp soft(noise)->hard(round) quant over training (0=off)
