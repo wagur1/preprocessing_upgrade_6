@@ -19,7 +19,7 @@ and `docs/IMPROVEMENTS.md` (line-by-line delta vs. the baseline and upgrade-2).
 | `cond` | `[B,1]` | normalized operating point (QP → [0,1]) fed to FiLM |
 | `x_pre` | `[B,C,T,H,W]` | preprocessor output (the edited pixels) |
 | `x̂` | `[B,C,T,H,W]` | codec reconstruction |
-| `bpp` | scalar | bits-per-pixel (proxy estimate at train, real coded at eval) |
+| `bpp` | scalar | bits-per-pixel (virtual proxy estimate; real coded for H.264/H.265) |
 | `m` | `[B,1,T,H,W]` in [0,1] | A2 task-saliency mask (1 = task-critical) |
 
 ## 1. The preprocessor `VideoPreprocessor` (`src/models/preprocessor.py`)
@@ -68,8 +68,7 @@ Matches x264/x265 **geometry** (the prime suspect for upgrade-2's poor transfer,
 where CompressAI's learned wavelet transform did not):
 
 ```
-P-frame residual r  (pred = previous SOURCE frame, or reconstructed frame when
-                      `closed_loop=true`; frame 0 = intra)
+P-frame residual r  (pred = previous SOURCE frame; frame 0 = intra)
   r ─► block DCT (bs×bs orthonormal) ─► coeffs
   coeffs / step(quality) ─► y ─► quantize ─► ŷ
   rate = Σ 0.5·log2(1 + 12·E[y²])          (factorised per-frequency, parameter-free)
@@ -88,10 +87,6 @@ P-frame residual r  (pred = previous SOURCE frame, or reconstructed frame when
 * **Honest bitrate never comes from here** — this module only supplies the
   differentiable rate+distortion signal at train time. Eval bpp is always the real
   x264/x265 coded size.
-
-`closed_loop=true` feeds each reconstructed P-frame back as the next reference,
-matching x26x drift semantics. The default `false` keeps the historical
-source-reference shortcut for backward compatibility.
 
 ### 2.2 `CompressAICodec` (`src/models/codec.py`)
 
@@ -209,26 +204,16 @@ Per step:
 6. Adam step; cosine LR; per-epoch val loss (proxy-only, fixed mid QP) drives
    best-checkpoint saving + early stopping; resume from `preprocessor_last.pth`.
 
-With `train.qp_per_step > 1`, several distinct QPs are evaluated before one
-optimizer update and their losses/gradients are averaged. Gradients are applied
-one point at a time, so this directly trains the rate-conditioned editor on
-multiple RD points without retaining all QP graphs in memory; validation uses
-the same deterministic multi-QP objective.
-
 **Two-stage recipe.** Stage 1 = fast proxy pretrain (`codec.kind=virtual`,
 `anneal=1.0`). Stage 2 = short real-codec calibration (`codec.kind=ste`,
 `ste_codec=h265`, `resume=true`, small LR) — a few hundred ffmpeg-in-the-loop steps.
-For a checkpoint intended to transfer to both anchors, set `ste_codec=both` and
-`ste_eval_codec=h265`; training samples H.264/H.265 per forward pass while eval
-remains deterministic.
 
 ---
 
 ## 7. Evaluation (`src/engine.py::evaluate`)
 
-Builds models with `role="eval"` (held-out analyzer). Traces **six pipelines** on
-real coders — `prep+{compressai,x264,x265}` vs bare `{compressai,x264,x265}` — over
-the eval QP grid, then computes:
+Builds models with `role="eval"` (held-out analyzer). By default it traces
+`prep+{x264,x265}` vs bare `{x264,x265}` over the eval QP grid, then computes:
 
 * **`bd_prep_gain`** — same-codec preprocessor gain (`prep+x265 vs x265`, …).
   **The real claim.** Negative = fewer bits at equal machine accuracy.
@@ -237,6 +222,7 @@ the eval QP grid, then computes:
 `src/metrics/bd_rate.py` integrates `log(rate)` over the overlapping accuracy range
 (Bjøntegaard) with **machine accuracy as the quality axis** (top-1 / AUC) instead
 of PSNR. Outputs: `results.json`, `curves.csv`, `rate_accuracy.png`, `qualitative.png`.
+Set `eval.include_proxy=true` to add virtual/CompressAI diagnostic curves.
 
 ---
 

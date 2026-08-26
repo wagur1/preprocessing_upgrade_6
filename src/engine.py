@@ -27,10 +27,9 @@ Two tasks dispatch on ``cfg['task']['name']``:
   * ``tracking``           -- GOT-10k clips + boxes, SiamFC logistic L_task,
     real success-plot AUC at eval (run the tracker over each sequence).
 
-Evaluation traces rate-accuracy curves with the *real* entropy/range coders and
-compares six pipelines -- prep+{compressai,h264,h265} vs the bare
-{compressai,h264,h265} anchors -- then reports BD-Rate (same-codec prep gain is
-the real claim).
+Evaluation traces real H.264/H.265 rate-accuracy curves by default and reports
+same-codec BD-Rate. Proxy curves are optional diagnostics
+(``eval.include_proxy=true``), not part of the deployment claim.
 """
 
 from __future__ import annotations
@@ -98,7 +97,6 @@ def _build_models(cfg: dict, device: torch.device, role: str = "train"):
             step_coarse=cc.get("step_coarse", 0.25),
             step_fine=cc.get("step_fine", 0.03),
             inter=cc.get("inter", True),
-            closed_loop=cc.get("closed_loop", False),
         ).to(device)
     else:
         proxy = CompressAICodec(
@@ -119,7 +117,6 @@ def _build_models(cfg: dict, device: torch.device, role: str = "train"):
             codec=cc.get("ste_codec", "h265"),
             quality_to_qp=q2qp,
             preset=cc.get("ste_preset", "medium"),
-            eval_codec=cc.get("ste_eval_codec"),
         )
     else:
         codec = proxy
@@ -236,61 +233,40 @@ def _earlystop_update(val, best, min_delta, no_improve, patience):
 @torch.no_grad()
 def _val_loss(pre, codec, analyzer, loader, weights, qp_list, qp_to_quality,
               cfg, prep_batch, max_batches):
-    """Mean proxy-only training loss over the val split (coherent stop signal).
+    """Mean proxy-only validation loss over every configured training QP.
 
-    Uses a fixed mid-range QP so the signal is comparable across epochs, and the
-    differentiable proxy only (no ffmpeg) so it stays cheap."""
+    Selecting a checkpoint at one QP can over-specialise the FiLM condition and
+    makes the other rate points look worse.  Average the same objective across
+    the full configured QP grid while keeping the proxy-only path cheap."""
     was_training = pre.training
     pre.eval()
-    val_codec = getattr(codec, "proxy", codec)
-    was_codec_training = val_codec.training
-    val_codec.eval()
-    qp_per_step = max(1, min(len(qp_list), int(cfg.get("train", {}).get("qp_per_step", 1))))
-    if qp_per_step == 1:
-        eval_qps = [qp_list[len(qp_list) // 2]]
-    else:
-        # Keep validation deterministic and representative of the full RD curve.
-        idx = torch.linspace(0, len(qp_list) - 1, qp_per_step).round().long().tolist()
-        eval_qps = [qp_list[i] for i in idx]
     total, nb = 0.0, 0
     for i, batch in enumerate(loader):
         if max_batches and i >= max_batches:
             break
         clips, target = prep_batch(batch)
-        # A2: use the SAME spatial mask objective as training so the checkpoint is
-        # selected on the objective it was trained under (pin the teacher first so
-        # the mask and the loss it steers come from one teacher -- see below).
-        if weights.use_task_mask:
-            if hasattr(analyzer, "pin_active"):
-                analyzer.pin_active()
-            mask = task_saliency(analyzer, clips, target)
-        else:
-            mask = None
-        point_parts = []
-        for qp in eval_qps:
+        qp_losses = []
+        for qp in qp_list:
             q = qp_to_quality[qp]
             cond = _rate_cond(_qp_norm(qp, cfg), clips.shape[0], clips.device, clips.dtype)
-            x_pre = pre(clips, cond)
-            # Validation is intentionally proxy-only.  In stage 2 ``codec`` is
-            # an STE wrapper whose forward would launch ffmpeg (and, with
-            # ``ste_codec=both``, randomly choose an anchor), making checkpoint
-            # selection both very slow and noisy.  The frozen differentiable
-            # proxy is the stable validation objective used by stage 1.
-            x_hat, bpp = val_codec(x_pre, q)
-            point_parts.append(
-                preprocessing_loss(analyzer, clips, x_hat, bpp, target, weights,
-                                   x_pre=x_pre, task_mask=mask)
-            )
-        parts = {key: torch.stack([p[key] for p in point_parts]).mean()
-                 for key in point_parts[0]}
-        if weights.use_task_mask and hasattr(analyzer, "unpin_active"):
-            analyzer.unpin_active()
-        total += parts["loss"].item()
+            # A2: use the SAME spatial mask objective as training and pin the
+            # sampled teacher so saliency/loss share one active teacher.
+            if weights.use_task_mask and hasattr(analyzer, "pin_active"):
+                analyzer.pin_active()
+            try:
+                mask = task_saliency(analyzer, clips, target) if weights.use_task_mask else None
+                x_pre = pre(clips, cond)
+                x_hat, bpp = codec(x_pre, q)
+                parts = preprocessing_loss(analyzer, clips, x_hat, bpp, target, weights,
+                                           x_pre=x_pre, task_mask=mask)
+            finally:
+                if weights.use_task_mask and hasattr(analyzer, "unpin_active"):
+                    analyzer.unpin_active()
+            qp_losses.append(parts["loss"].item())
+        total += sum(qp_losses) / max(len(qp_losses), 1)
         nb += 1
     if was_training:
         pre.train()
-    if was_codec_training:
-        val_codec.train()
     return total / max(nb, 1)
 
 
@@ -393,9 +369,6 @@ def _fit(cfg, pre, codec, analyzer, train_loader, val_loader, prep_batch,
     # task+distill+temporal fix a useful basin first. lam_task/omega/tau stay full.
     warmup_frac = float(tr.get("reg_warmup_frac", 0.3))
     warmup_steps = max(1, int(warmup_frac * total_steps)) if warmup_frac > 0 else 0
-    qp_per_step = max(1, int(tr.get("qp_per_step", 1)))
-    if qp_per_step > len(qp_list):
-        qp_per_step = len(qp_list)
     for epoch in range(start_epoch, epochs):
         pbar = tqdm(train_loader, desc=f"epoch {epoch + 1}/{epochs}")
         for batch in pbar:
@@ -405,45 +378,25 @@ def _fit(cfg, pre, codec, analyzer, train_loader, val_loader, prep_batch,
             warm = 1.0 if warmup_steps == 0 else min(1.0, step / warmup_steps)
             step_w = replace(weights, beta=weights.beta * warm,
                              gamma=weights.gamma * warm, delta=weights.delta * warm)
+            qp = random.choice(qp_list)
+            q = qp_to_quality[qp]
+            cond = _rate_cond(_qp_norm(qp, cfg), clips.shape[0], clips.device, clips.dtype)
             # A2: keep the sampled teacher fixed for saliency, task loss, and
             # feature distillation within this step.
             pinned = bool(weights.use_task_mask and hasattr(analyzer, "pin_active"))
             if pinned:
                 analyzer.pin_active()
-            opt.zero_grad(set_to_none=True)
             try:
                 mask = task_saliency(analyzer, clips, target) if weights.use_task_mask else None
-                # Optimise several operating points with the same update.  This
-                # reduces the high-variance single-QP gradient and prevents the
-                # FiLM-conditioned editor from overfitting whichever QP happened
-                # to be sampled on the last few steps.
-                step_qps = (random.sample(qp_list, qp_per_step)
-                            if qp_per_step > 1 else [random.choice(qp_list)])
-                point_parts = []
-                for qp in step_qps:
-                    q = qp_to_quality[qp]
-                    cond = _rate_cond(_qp_norm(qp, cfg), clips.shape[0], clips.device, clips.dtype)
-                    x_pre = pre(clips, cond)
-                    x_hat, bpp = codec(x_pre, q)
-                    point = preprocessing_loss(analyzer, clips, x_hat, bpp, target, step_w,
-                                               x_pre=x_pre, task_mask=mask)
-                    # Backprop each RD point immediately. This computes the
-                    # gradient of their mean without retaining all QP graphs,
-                    # keeping multi-QP training practical on a 16 GB T4.
-                    (point["loss"] / len(step_qps)).backward()
-                    point_parts.append({
-                        key: (value.detach() if torch.is_tensor(value) else value)
-                        for key, value in point.items()
-                    })
-                parts = {
-                    key: (torch.stack([p[key] for p in point_parts]).mean()
-                          if torch.is_tensor(point_parts[0][key])
-                          else sum(p[key] for p in point_parts) / len(point_parts))
-                    for key in point_parts[0]
-                }
+                x_pre = pre(clips, cond)
+                x_hat, bpp = codec(x_pre, q)
+                parts = preprocessing_loss(analyzer, clips, x_hat, bpp, target, step_w,
+                                           x_pre=x_pre, task_mask=mask)
             finally:
                 if pinned:
                     analyzer.unpin_active()
+            opt.zero_grad(set_to_none=True)
+            parts["loss"].backward()
             opt.step()
             if sched is not None:
                 sched.step()
@@ -455,8 +408,7 @@ def _fit(cfg, pre, codec, analyzer, train_loader, val_loader, prep_batch,
                              tmp=f"{parts['loss_temp'].item():.4f}",
                              dlt=f"{parts['loss_delta'].item():.4f}",
                              tv=f"{parts['loss_tv'].item():.4f}",
-                             lr=f"{opt.param_groups[0]['lr']:.1e}",
-                             qp="/".join(map(str, step_qps)))
+                             lr=f"{opt.param_groups[0]['lr']:.1e}", qp=qp)
             if max_steps and step >= max_steps:
                 stop = True
                 break
@@ -620,12 +572,14 @@ def _evaluate_classification(cfg, pre, codec, analyzer, out_dir) -> dict:
         frame_size=cfg["data"].get("frame_size", 128),
         temporal_stride=cfg["data"].get("temporal_stride", 2),
         train=False,
+        return_metadata=bool(ev.get("per_sequence", False)),
     )
     loader = DataLoader(
         ds, batch_size=ev.get("batch_size", 4), shuffle=False,
         num_workers=ev.get("num_workers", 2), collate_fn=collate_clips,
     )
     qps = ev.get("qp_list", [30, 35, 40, 45, 50])
+    include_proxy = bool(ev.get("include_proxy", False))
     have_ffmpeg = ffmpeg_available()
     if not have_ffmpeg:
         print("[eval] WARNING: ffmpeg not found -> skipping H.264/H.265 anchors")
@@ -634,35 +588,33 @@ def _evaluate_classification(cfg, pre, codec, analyzer, out_dir) -> dict:
     proxy_name = _proxy_name(cfg)
     prep_proxy_name = f"prep+{proxy_name}"
     qmid = codec.qualities[len(codec.qualities) // 2]
-    qconds = _quality_conds(cfg, codec)  # per-quality FiLM cond matching training
+    qconds = _quality_conds(cfg, codec) if include_proxy else {}
     saved_vis = False
-    for clips, labels in tqdm(loader, desc="eval"):
+    sequence_store = {} if ev.get("per_sequence", False) else None
+    for batch in tqdm(loader, desc="eval"):
+        if len(batch) == 3:
+            clips, labels, metadata = batch
+        else:
+            clips, labels = batch
+            metadata = None
         clips = clips.to(device)
         labels = labels.to(device)
         # Rate-conditioned: the preprocessor output depends on the operating
         # point, so it is recomputed per rate point (cannot preprocess once).
-        for q in codec.qualities:
-            cond = _rate_cond(qconds[q], clips.shape[0], clips.device, clips.dtype)
-            with torch.no_grad():
-                x_pre = pre(clips, cond)
-            if not saved_vis:
-                spread = float(x_pre.detach().amax() - x_pre.detach().amin())
-                mean = float(x_pre.detach().mean())
-                if spread < 1e-3:
-                    print(
-                        f"[eval][warning] preprocessor output nearly constant "
-                        f"(mean={mean:.6f}, spread={spread:.6f}); "
-                        "rate-accuracy points will be degenerate"
-                    )
-            xh, bpp = codec.compress_decompress(x_pre, q)
-            s, n = _task_metric(analyzer, xh, labels)
-            _accumulate(store, prep_proxy_name, q, bpp, s, n)
-            if not saved_vis and q == qmid:
-                _save_qualitative(out_dir / "qualitative.png", clips, x_pre, xh)
-                saved_vis = True
-            xh0, bpp0 = codec.compress_decompress(clips, q)
-            s0, n0 = _task_metric(analyzer, xh0, labels)
-            _accumulate(store, proxy_name, q, bpp0, s0, n0)
+        if include_proxy:
+            for q in codec.qualities:
+                cond = _rate_cond(qconds[q], clips.shape[0], clips.device, clips.dtype)
+                with torch.no_grad():
+                    x_pre = pre(clips, cond)
+                xh, bpp = codec.compress_decompress(x_pre, q)
+                s, n = _task_metric(analyzer, xh, labels)
+                _accumulate(store, prep_proxy_name, q, bpp, s, n)
+                if not saved_vis and q == qmid:
+                    _save_qualitative(out_dir / "qualitative.png", clips, x_pre, xh)
+                    saved_vis = True
+                xh0, bpp0 = codec.compress_decompress(clips, q)
+                s0, n0 = _task_metric(analyzer, xh0, labels)
+                _accumulate(store, proxy_name, q, bpp0, s0, n0)
         if have_ffmpeg:
             for name in ("h264", "h265"):
                 for qp in qps:
@@ -670,16 +622,49 @@ def _evaluate_classification(cfg, pre, codec, analyzer, out_dir) -> dict:
                     with torch.no_grad():
                         x_pre = pre(clips, cond)
                     sc = StandardCodec(codec=name, qp=qp, preset=ev.get("preset", "medium"))
-                    xh, bpp = sc.compress_decompress(clips)
-                    s, n = _task_metric(analyzer, xh.to(device), labels)
-                    _accumulate(store, name, qp, bpp, s, n)
-                    xhp, bppp = sc.compress_decompress(x_pre)   # prep + real codec
-                    sp, np_ = _task_metric(analyzer, xhp.to(device), labels)
-                    _accumulate(store, f"prep+{name}", qp, bppp, sp, np_)
+                    xh, bpps = sc.compress_decompress_items(clips)
+                    xhp, bppps = sc.compress_decompress_items(x_pre)
+                    logits = analyzer.predict(xh.to(device))
+                    logits_p = analyzer.predict(xhp.to(device))
+                    probs = logits.softmax(dim=1)
+                    probs_p = logits_p.softmax(dim=1)
+                    target_prob = probs.gather(1, labels[:, None]).squeeze(1)
+                    target_prob_p = probs_p.gather(1, labels[:, None]).squeeze(1)
+                    correct = (logits.argmax(dim=1) == labels)
+                    correct_p = (logits_p.argmax(dim=1) == labels)
+                    s, n = float(correct.sum().item()), int(labels.shape[0])
+                    sp, np_ = float(correct_p.sum().item()), int(labels.shape[0])
+                    _accumulate(store, name, qp, sum(bpps) / max(n, 1), s, n)
+                    _accumulate(store, f"prep+{name}", qp, sum(bppps) / max(np_, 1), sp, np_)
+                    if sequence_store is not None:
+                        for i, meta in enumerate(metadata):
+                            sid = str(meta["sequence_id"])
+                            rec = sequence_store.setdefault(sid, {
+                                "sequence_id": sid,
+                                "path": meta["path"],
+                                "class": meta["class"],
+                                "codecs": {},
+                            })
+                            codec_rec = rec["codecs"].setdefault(name, {})
+                            codec_rec[str(qp)] = {
+                                "bpp": float(bpps[i]),
+                                "top1": int(correct[i].item()),
+                                "target_prob": float(target_prob[i].item()),
+                            }
+                            prep_rec = rec["codecs"].setdefault(f"prep+{name}", {})
+                            prep_rec[str(qp)] = {
+                                "bpp": float(bppps[i]),
+                                "top1": int(correct_p[i].item()),
+                                "target_prob": float(target_prob_p[i].item()),
+                            }
+                    if not saved_vis and name == "h265" and qp == qps[len(qps) // 2]:
+                        _save_qualitative(out_dir / "qualitative.png", clips, x_pre, xhp)
+                        saved_vis = True
 
     curves = {m: _curve(store[m]) for m in store}
+    sequence_extra = _sequence_reports(out_dir, sequence_store, qps) if sequence_store is not None else None
     return _finalize(curves, out_dir, task="action_recognition", metric="top1",
-                     n_eval=len(ds), proxy_name=proxy_name)
+                     n_eval=len(ds), proxy_name=proxy_name, extra=sequence_extra)
 
 
 # -- tracking eval ---------------------------------------------------------
@@ -763,6 +748,7 @@ def _evaluate_tracking(cfg, pre, codec, analyzer, out_dir) -> dict:
     max_seqs = ev.get("max_seqs", 30)
     chunk = ev.get("codec_chunk", 16)
     qps = ev.get("qp_list", [30, 35, 40, 45, 50])
+    include_proxy = bool(ev.get("include_proxy", False))
     track = _resolve_tracker(cfg, analyzer)
     have_ffmpeg = ffmpeg_available()
     if not have_ffmpeg:
@@ -773,17 +759,18 @@ def _evaluate_tracking(cfg, pre, codec, analyzer, out_dir) -> dict:
     store: dict = {}
     proxy_name = _proxy_name(cfg)
     prep_proxy_name = f"prep+{proxy_name}"
-    qconds = _quality_conds(cfg, codec)  # per-quality FiLM cond matching training
+    qconds = _quality_conds(cfg, codec) if include_proxy else {}
     for name, clip, gt, valid in tqdm(seqs, desc="eval-track"):
         clip = clip.to(device)
         init = gt[0]
         # Rate-conditioned: preprocess per operating point (output depends on it).
-        for q in codec.qualities:
-            cond = _rate_cond(qconds[q], clip.shape[0], clip.device, clip.dtype)
-            xh, bpp = _codec_chunked(pre, codec, clip, q, chunk, use_pre=True, cond=cond)
-            _acc_track(store, prep_proxy_name, q, bpp, track(xh, init), gt, valid)
-            xh0, bpp0 = _codec_chunked(pre, codec, clip, q, chunk, use_pre=False)
-            _acc_track(store, proxy_name, q, bpp0, track(xh0, init), gt, valid)
+        if include_proxy:
+            for q in codec.qualities:
+                cond = _rate_cond(qconds[q], clip.shape[0], clip.device, clip.dtype)
+                xh, bpp = _codec_chunked(pre, codec, clip, q, chunk, use_pre=True, cond=cond)
+                _acc_track(store, prep_proxy_name, q, bpp, track(xh, init), gt, valid)
+                xh0, bpp0 = _codec_chunked(pre, codec, clip, q, chunk, use_pre=False)
+                _acc_track(store, proxy_name, q, bpp0, track(xh0, init), gt, valid)
         if have_ffmpeg:
             for cname in ("h264", "h265"):
                 for qp in qps:
@@ -818,8 +805,74 @@ def _bd_pair(curves: dict, test_name: str, anchor_name: str):
     }
 
 
+def _sequence_reports(out_dir: Path, sequence_store: dict, qps: list[int]):
+    """Write per-sequence rate/accuracy points and same-codec BD metrics.
+
+    Top-1 is retained as a binary diagnostic.  For BD-Rate per sequence we use
+    the model probability assigned to the ground-truth class (``target_prob``),
+    because a 0/1 metric cannot form a useful five-point curve for most videos.
+    """
+    import csv
+
+    points_path = out_dir / "sequence_points.csv"
+    with open(points_path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["sequence_id", "path", "class", "codec", "qp", "bpp", "top1", "target_prob"])
+        for rec in sequence_store.values():
+            for codec, points in rec["codecs"].items():
+                for qp, value in points.items():
+                    w.writerow([rec["sequence_id"], rec["path"], rec["class"], codec, qp,
+                                f"{value['bpp']:.8f}", value["top1"], f"{value['target_prob']:.8f}"])
+
+    per_sequence = {}
+    bd_rows = []
+    for sid, rec in sequence_store.items():
+        codec_metrics = {}
+        for codec in ("h264", "h265"):
+            anchor = rec["codecs"].get(codec, {})
+            prep = rec["codecs"].get(f"prep+{codec}", {})
+            if not anchor or not prep:
+                continue
+            ordered = [str(q) for q in qps if str(q) in anchor and str(q) in prep]
+            if len(ordered) < 2:
+                continue
+            ra = [anchor[q]["bpp"] for q in ordered]
+            ma = [anchor[q]["target_prob"] for q in ordered]
+            rt = [prep[q]["bpp"] for q in ordered]
+            mt = [prep[q]["target_prob"] for q in ordered]
+            rate = _finite_or_none(bd_rate(ra, ma, rt, mt))
+            acc = _finite_or_none(bd_metric(ra, ma, rt, mt))
+            codec_metrics[f"prep+{codec} vs {codec}"] = {
+                "bd_rate_pct": rate,
+                "bd_accuracy": acc,
+                "metric": "target_prob",
+                "n_points": len(ordered),
+            }
+            bd_rows.append([rec["sequence_id"], rec["path"], rec["class"], codec, rate, acc, len(ordered)])
+        if codec_metrics:
+            per_sequence[sid] = {
+                "sequence_id": rec["sequence_id"],
+                "path": rec["path"],
+                "class": rec["class"],
+                "bd_prep_gain": codec_metrics,
+            }
+
+    bd_path = out_dir / "sequence_bd_rate.csv"
+    with open(bd_path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["sequence_id", "path", "class", "codec", "bd_rate_pct", "bd_accuracy", "n_points", "metric"])
+        for row in bd_rows:
+            w.writerow(row + ["target_prob"])
+    json_path = out_dir / "sequence_bd_rate.json"
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump({"metric": "target_prob", "n_sequences": len(sequence_store),
+                   "sequences_with_bd": len(per_sequence), "results": per_sequence}, f, indent=2)
+    print(f"[eval] wrote {points_path}, {bd_path}, {json_path}")
+    return {"per_sequence": per_sequence, "per_sequence_metric": "target_prob"}
+
+
 def _finalize(curves: dict, out_dir: Path, task: str, metric: str, n_eval: int,
-              proxy_name: str) -> dict:
+              proxy_name: str, extra: dict | None = None) -> dict:
     prep_proxy_name = f"prep+{proxy_name}"
     # Cross-codec view is reference-only; the same-codec pairs below are the claim.
     bd = {}
@@ -841,6 +894,8 @@ def _finalize(curves: dict, out_dir: Path, task: str, metric: str, n_eval: int,
         "bd_prep_gain": prep_gain,
         "n_eval": n_eval,
     }
+    if extra:
+        results.update(extra)
     with open(out_dir / "results.json", "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2)
     _write_csv(out_dir / "curves.csv", curves)
@@ -883,7 +938,7 @@ def _plot(path: Path, curves: dict, metric: str) -> None:
     }
     for method, c in curves.items():
         plt.plot(c["bpp"], c["accuracy"], label=method, **styles.get(method, {}))
-    plt.xlabel("bits per pixel (real coded)")
+    plt.xlabel("bits per pixel (proxy estimate; real coded for H.264/H.265)")
     plt.ylabel(ylabel)
     plt.title("Rate vs machine-vision accuracy")
     plt.legend()

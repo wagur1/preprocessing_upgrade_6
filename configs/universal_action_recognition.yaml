@@ -37,13 +37,11 @@ codec:                              # differentiable TRAINING proxy
   qualities: [1, 2, 3, 5, 8]
   block: 8
   inter: true
-  closed_loop: false             # set true to train with reconstructed P-frame references
   step_coarse: 3.0                  # coarsest quant step (fewest bits)
   step_fine: 1.0                    # finest quant step (most bits)
   anneal: 1.0                       # A3: ramp soft(noise)->hard(round) quant over training (0=off)
   # ---- stage-2 STE calibration (set kind: ste) -------------------------------
-  # ste_codec: both                 # h264 | h265 | both (sample per train step)
-  # ste_eval_codec: h265            # deterministic eval codec when using both
+  # ste_codec: h265                 # real codec run in the forward pass
   # ste_preset: medium
 
 data:
@@ -68,21 +66,25 @@ train:
   epochs: 5
   max_steps: null        # cap steps for quick Kaggle runs (e.g. 300)
   reg_warmup_frac: 0.5   # let task/distillation establish a useful basin before smoothing bites
-  qp_per_step: 1         # set 3 to optimise several RD points per update
   batch_size: 4
   num_workers: 2
   lr: 1.0e-4
-  qp_list: [22, 27, 32, 37, 42]                        # REVERTED: [30-50] made training collapse (all-blank, acc=0). Wider range keeps high-quality points that keep L_task alive.
-  qp_to_quality: {22: 5, 27: 3, 32: 2, 37: 1, 42: 1}   # ponytail: mild qp45/50 eval extrapolation is the lesser evil vs collapse
+  # In-grid protocol: train every operating point used by the final BD curve.
+  # Distinct proxy qualities also make STE map each quality to one real QP.
+  qp_list: [30, 35, 40, 45, 50]
+  qp_to_quality: {30: 8, 35: 5, 40: 3, 45: 2, 50: 1}
   cosine: true
   patience: 5
   min_delta: 1.0e-4
-  val_max_batches: 20
+  val_qp_mode: all       # select checkpoints on the mean objective over all QPs
+  val_max_batches: 5     # all-QP validation is 5x the previous mid-QP validation
   resume: false
   finetune: false
 
 eval:
   split: test
+  include_proxy: false              # paper tables use only real H.264/H.265; true = proxy debug curve
+  per_sequence: true                # sequence_points.csv + sequence_bd_rate.csv/json
   batch_size: 4
   num_workers: 2
   # ---- A1: generalisation test -- a backbone NOT in task.teachers ------------

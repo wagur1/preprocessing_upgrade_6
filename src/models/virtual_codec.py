@@ -8,19 +8,15 @@ transfer to the real block-DCT codecs.
 
 Pipeline, per clip ``[B,C,T,H,W]`` in [0,1]:
 
-    predict (I-frame: none; P-frame: previous SOURCE frame)  -> residual r
+    predict (I-frame: none; P-frame: previous RECONSTRUCTED frame) -> residual r
     r  -> block DCT (bs x bs, orthonormal)                   -> coeffs
     coeffs / step(quality)  -> y            (step = quantiser coarseness knob)
     y  -> quantise (add-noise train / round eval)            -> y_hat
     rate = per-frequency Gaussian entropy of y  (factorised, parameter-free)
     y_hat * step  -> inverse block DCT -> r_hat -> x_hat = pred + r_hat
 
-Faithful: block DCT, block-wise scalar quant, P-frame temporal prediction, a
-factorised per-frequency rate. Deliberate proxy corners (ponytail):
-  * open-loop prediction -- reference is the SOURCE previous frame, not the
-    reconstructed one, so no drift term (the historical default).
-  * optional ``closed_loop=True`` feeds each reconstructed frame back as the
-    next reference, matching x26x inter prediction and exposing drift.
+Faithful: block DCT, block-wise scalar quant, closed-loop P-frame prediction,
+and a factorised per-frequency rate. Deliberate proxy corner (ponytail):
   * parameter-free Gaussian rate instead of a *trained* Balle factorised prior,
     so the codec stays frozen and the optimiser still touches only the
     preprocessor. Swap in a trained EntropyBottleneck if the rate proves coarse.
@@ -61,9 +57,8 @@ class VirtualCodec(nn.Module):
             quality id rises. These are physical calibration knobs (they set
             where the rate curve lands); tune them to overlap the x264/x265 bpp
             range, not blindly.
-        inter: enable P-frame prediction.
-        closed_loop: use reconstructed previous frames as references (realistic
-            drift); ``False`` preserves the historical source-reference proxy.
+        inter: enable closed-loop P-frame prediction (previous reconstruction as
+            reference), matching codec reference-frame drift.
     """
 
     def __init__(
@@ -74,7 +69,6 @@ class VirtualCodec(nn.Module):
         step_coarse: float = 0.25,
         step_fine: float = 0.03,
         inter: bool = True,
-        closed_loop: bool = False,
     ):
         super().__init__()
         if isinstance(qualities, int):
@@ -82,7 +76,6 @@ class VirtualCodec(nn.Module):
         self.qualities = list(qualities)
         self.block = int(block)
         self.inter = bool(inter)
-        self.closed_loop = bool(closed_loop)
         self.register_buffer("_D", _dct_basis(self.block), persistent=False)
         # Soft->hard quantiser annealing (upgrade3 A3). 0 = additive-uniform-noise
         # (fully soft, the upgrade2 default); 1 = straight-through hard rounding.
@@ -112,14 +105,6 @@ class VirtualCodec(nn.Module):
     def _crop(x: torch.Tensor, hw) -> torch.Tensor:
         h, w = hw
         return x[..., :h, :w]
-
-    def _residual(self, x: torch.Tensor):
-        """P-frame residual: pred = previous source frame (frame 0 = intra)."""
-        if not self.inter or x.shape[2] < 2:
-            return x, torch.zeros_like(x)
-        pred = torch.zeros_like(x)
-        pred[:, :, 1:] = x[:, :, :-1]
-        return x - pred, pred
 
     # -- block DCT / inverse (channel layout: [N, C*bs*bs, H/bs, W/bs]) ----
     def _dct(self, r: torch.Tensor) -> torch.Tensor:
@@ -167,37 +152,19 @@ class VirtualCodec(nn.Module):
     def _code(self, x: torch.Tensor, quality: int, training: bool):
         B, C, T, H, W = x.shape
         step = self._steps[int(quality)]
-        if self.inter and self.closed_loop and T > 1:
-            # Match a real inter codec's reference semantics: each P-frame is
-            # predicted from the *reconstructed* previous frame.  The previous
-            # source-frame shortcut remains the default for backward
-            # compatibility, while this branch exposes drift to the training
-            # objective and improves proxy -> x264/x265 transfer.
-            recon_frames, total_bits = [], x.new_zeros(())
-            previous = None
-            for ti in range(T):
-                frame = x[:, :, ti]
-                pred = torch.zeros_like(frame) if previous is None else previous
-                residual = frame - pred
-                residual, hw = self._pad(residual)
-                ph, pw = residual.shape[-2:]
-                y_hat, bits = self._quant_rate(self._dct(residual), step, training)
-                r_hat = self._crop(
-                    self._idct(y_hat * step, C, ph, pw), hw
-                )
-                previous = (pred + r_hat).clamp(0.0, 1.0)
-                recon_frames.append(previous)
-                total_bits = total_bits + bits
-            x_hat = torch.stack(recon_frames, dim=2)
-            return x_hat, total_bits / (B * T * H * W)
-        r, pred = self._residual(x)
-        frames = r.permute(0, 2, 1, 3, 4).reshape(B * T, C, H, W)
-        frames, hw = self._pad(frames)
-        ph, pw = frames.shape[-2:]
-        y_hat, total_bits = self._quant_rate(self._dct(frames), step, training)
-        r_hat = self._crop(self._idct(y_hat * step, C, ph, pw), hw)
-        r_hat = r_hat.reshape(B, T, C, H, W).permute(0, 2, 1, 3, 4)
-        x_hat = (pred + r_hat).clamp(0.0, 1.0)
+        recon, prev = [], None
+        total_bits = x.new_zeros(())
+        for t in range(T):
+            frame = x[:, :, t]
+            pred = prev if self.inter and prev is not None else torch.zeros_like(frame)
+            residual, hw = self._pad(frame - pred)
+            ph, pw = residual.shape[-2:]
+            y_hat, bits = self._quant_rate(self._dct(residual), step, training)
+            r_hat = self._crop(self._idct(y_hat * step, C, ph, pw), hw)
+            prev = (pred + r_hat).clamp(0.0, 1.0)
+            recon.append(prev)
+            total_bits = total_bits + bits
+        x_hat = torch.stack(recon, dim=2)
         return x_hat, total_bits / (B * T * H * W)
 
     # -- training path (differentiable) ------------------------------------
@@ -228,11 +195,23 @@ def _demo() -> None:
     _, bpp_fine = cod.compress_decompress(x, 8)
     _, bpp_coarse = cod.compress_decompress(x, 1)
     assert bpp_coarse < bpp_fine, (bpp_coarse, bpp_fine)
-    # closed-loop inter prediction exposes reference drift while preserving
-    # shape, finiteness and the monotone rate knob.
-    cod_loop = VirtualCodec(qualities=(1, 8), block=8, closed_loop=True)
-    xl, bl = cod_loop.compress_decompress(x, 1)
-    assert xl.shape == x.shape and torch.isfinite(xl).all() and math.isfinite(bl)
+    mse = []
+    for q in (1, 3, 5, 8):
+        xq, _ = cod.compress_decompress(x, q)
+        mse.append(float((xq - x).square().mean()))
+    # Scalar rounding can make neighbouring QPs cross on a single random clip;
+    # the invariant we need is that the fine endpoint beats the coarse endpoint.
+    assert mse[0] > mse[-1], mse
+    # Headline Kaggle calibration must also improve distortion as rate rises.
+    calibrated = VirtualCodec(
+        qualities=(1, 2, 3, 5, 8), block=8, step_coarse=3.0, step_fine=1.0
+    )
+    smooth = F.avg_pool3d(x, kernel_size=(1, 5, 5), stride=1, padding=(0, 2, 2))
+    calibrated_mse = []
+    for q in calibrated.qualities:
+        xq, _ = calibrated.compress_decompress(smooth, q)
+        calibrated_mse.append(float((xq - smooth).square().mean()))
+    assert calibrated_mse[0] > calibrated_mse[-1], calibrated_mse
     # forward is differentiable and feeds gradient to its input
     xin = torch.rand(2, 3, 4, 32, 32, requires_grad=True)
     xh, bpp = cod(xin, 3)

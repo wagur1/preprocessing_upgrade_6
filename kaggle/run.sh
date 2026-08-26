@@ -14,6 +14,7 @@ KINETICS_ROOT=${KINETICS_ROOT:-/kaggle/input/kinetics-train-5per/train}
 HELD_OUT=${HELD_OUT:-r2plus1d_18}
 SEED=${SEED:-0}
 OUT_DIR=${OUT_DIR:-outputs/seed_$SEED}
+STE_MAX_STEPS=${STE_MAX_STEPS:-400}
 [[ "$OUT_DIR" == outputs/* ]] || { echo "ERROR: OUT_DIR must be under outputs/" >&2; exit 1; }
 CKPT_DIR=$OUT_DIR/checkpoints
 EVAL_STAGE1=$OUT_DIR/eval_stage1
@@ -84,7 +85,7 @@ echo "== 4. STAGE 2: real-codec (STE) calibration fine-tune (loads Stage-1, over
 python train.py --config "$CFG" data.index="$INDEX" \
     codec.kind=ste codec.ste_codec=h265 \
     seed="$SEED" out_dir="$OUT_DIR" \
-    train.finetune=true train.resume=false train.epochs=6 train.lr=3e-5 train.max_steps=400
+    train.finetune=true train.resume=false train.epochs=6 train.lr=3e-5 train.max_steps="$STE_MAX_STEPS"
 
 echo "== 5. eval STAGE 2 (after STE calibration) on HELD-OUT analyzer + real x264/x265 =="
 python evaluate.py --config "$CFG" \

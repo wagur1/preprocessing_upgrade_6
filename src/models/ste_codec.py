@@ -25,8 +25,7 @@ existing ``codec(x, quality)`` call unchanged.
 
 from __future__ import annotations
 
-import random
-from typing import Dict, List, Sequence
+from typing import Dict, List
 
 import torch
 import torch.nn as nn
@@ -40,52 +39,27 @@ class STECodec(nn.Module):
     Args:
         proxy: a differentiable codec (``VirtualCodec`` / ``CompressAICodec``)
             exposing ``forward(x, quality) -> (x_hat, bpp)``.
-        codec: ``"h264"``, ``"h265"`` or ``"both"``. The latter samples a
-            deployment codec per training forward pass for robust transfer.
+        codec: ``"h264"`` or ``"h265"`` -- the real deployment codec.
         quality_to_qp: maps each proxy quality id to the real-codec QP to encode
             at (the inverse of the config's ``train.qp_to_quality``).
         preset: x264/x265 speed preset.
-        eval_codec: deterministic codec used by ``compress_decompress`` when
-            training with more than one codec.
     """
 
     def __init__(
         self,
         proxy: nn.Module,
-        codec: str | Sequence[str] = "h265",
+        codec: str = "h265",
         quality_to_qp: Dict[int, int] | None = None,
         preset: str = "medium",
-        eval_codec: str | None = None,
     ):
         super().__init__()
         if not ffmpeg_available():
             raise RuntimeError("STECodec needs ffmpeg (with libx264/libx265) on PATH")
         self.proxy = proxy
-        if isinstance(codec, str):
-            # ``both`` is a convenient config spelling for cross-codec training.
-            codecs = ["h264", "h265"] if codec.lower() == "both" else [codec]
-        else:
-            codecs = list(codec)
-        if not codecs or any(c not in ("h264", "h265") for c in codecs):
-            raise ValueError("codec must be 'h264', 'h265', 'both', or a sequence of those")
-        self.codecs = tuple(dict.fromkeys(codecs))
-        self.codec = self.codecs[0]  # backwards-compatible public attribute
-        self.eval_codec = (eval_codec or self.codecs[0]).lower()
-        if self.eval_codec not in self.codecs:
-            raise ValueError("eval_codec must be one of the training codecs")
+        self.codec = codec
         self.preset = preset
         self.quality_to_qp = {int(k): int(v) for k, v in (quality_to_qp or {}).items()}
         self.qualities: List[int] = list(getattr(proxy, "qualities", []))
-
-    def _training_codec(self) -> str:
-        """Pick a deployment codec for this forward pass.
-
-        Sampling is enabled only during training.  Evaluation uses the fixed
-        ``eval_codec`` so that its rate/accuracy curve remains deterministic.
-        """
-        if self.training and len(self.codecs) > 1:
-            return random.choice(self.codecs)
-        return self.eval_codec
 
     def _qp(self, quality: int) -> int:
         if quality in self.quality_to_qp:
@@ -95,7 +69,7 @@ class STECodec(nn.Module):
 
     def forward(self, x: torch.Tensor, quality: int):
         x_p, bpp_p = self.proxy(x, quality)                       # differentiable
-        sc = StandardCodec(codec=self._training_codec(), qp=self._qp(quality), preset=self.preset)
+        sc = StandardCodec(codec=self.codec, qp=self._qp(quality), preset=self.preset)
         with torch.no_grad():
             x_r, bpp_r = sc.compress_decompress(x.detach())       # real ffmpeg
             x_r = x_r.to(x_p.device, x_p.dtype)
@@ -107,7 +81,7 @@ class STECodec(nn.Module):
     @torch.no_grad()
     def compress_decompress(self, x: torch.Tensor, quality: int):
         """Eval path -> honest real-codec reconstruction + bpp (no proxy)."""
-        sc = StandardCodec(codec=self.eval_codec, qp=self._qp(quality), preset=self.preset)
+        sc = StandardCodec(codec=self.codec, qp=self._qp(quality), preset=self.preset)
         x_r, bpp_r = sc.compress_decompress(x)
         return x_r.to(x.device), float(bpp_r)
 

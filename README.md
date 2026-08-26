@@ -1,110 +1,258 @@
-# VCM Preprocessing Upgrade 5
+# pre_processing_upgrade_3
 
-Bộ công cụ preprocessing và tối ưu hóa cho **Video Coding for Machines (VCM)**. Mục tiêu là giữ chất lượng tác vụ AI sau khi encode/decode, đồng thời giảm bitrate và chi phí tính toán.
+**Universal, analyzer-agnostic video preprocessing for Video Coding for Machines (VCM), in front of a *frozen* standard codec (x264 / x265).**
 
-## Chạy thử trên Kaggle với Kinetics-400-5%
+Only a small preprocessor network is trained. The video codec and every downstream
+vision model ("analyzer") stay frozen and standard — no bitstream changes, no
+decoder changes, no per-CTU QP maps. The preprocessor edits pixels *before*
+encoding so that, at the same bitrate, a machine still sees what it needs.
 
-Tạo một notebook Kaggle bật Internet, sau đó chạy các cell sau:
+> 🇻🇳 **Tóm tắt.** Đây là bản nâng cấp 3 của pipeline tiền xử lý VCM. Chỉ huấn
+> luyện *preprocessor* đặt **trước** một codec tiêu chuẩn (x264/x265) **đóng
+> băng**; codec và mạng phân tích (analyzer) không đổi. Ba đóng góp mới so với
+> upgrade2: **(A1)** preprocessor *phổ quát* học từ một *hội đồng nhiều teacher*
+> và được kiểm chứng trên analyzer **chưa từng thấy** (held-out); **(A2)** *mặt nạ
+> tầm quan trọng theo tác vụ* để dồn bit vào vùng máy cần; **(A3)** *hiệu chỉnh
+> theo codec thật* (chạy codec thật trong forward + gradient qua proxy, cùng
+> annealing lượng tử mềm→cứng). Hướng dẫn chạy trên Kaggle: [`docs/KAGGLE.md`](docs/KAGGLE.md).
+
+```
+                     (trained)              (FROZEN)                 (FROZEN panel)
+ video x ─► Preprocessor θ ─► x_pre ─► Standard codec ─► x̂ ─► Analyzer(s) ─► machine label
+            U-Net + FiLM(rate)          x264 / x265                r3d_18 / mc3_18 / …
+            + SFT(motion)               (proxy at train time)      + a HELD-OUT analyzer at eval
+            + task-mask (A2)
+```
+
+The claim we optimize is the **preprocessor gain on the *same* codec**:
+`BD-Rate(prep+x265 vs x265)` and `BD-Rate(prep+x264 vs x264)` — negative means the
+preprocessor lets the machine reach the same accuracy at fewer bits. (Cross-codec
+comparisons are reported too, but QP is not comparable across codecs, so they are
+reference-only.)
+
+---
+
+## Why upgrade-3 (what was limiting upgrade-2)
+
+The direct baseline is **Zhao et al., "A Preprocessing Framework for Video Machine
+Vision under Compression," arXiv:2512.15331 (2025)** — a neural preprocessor
+trained through a differentiable *virtual codec* and deployed in front of real
+x264/x265, reporting **> 15 % BD-Rate** savings across action-recognition and
+tracking backbones.
+
+Our `upgrade2` reproduced the *harness* (differentiable proxy, real-codec eval,
+BD-Rate-on-accuracy) and reached a **working but modest** operating point:
+in-domain `prep+compressai` ≈ −2 to −6 % with positive BD-accuracy, but transfer
+to real x264/x265 stalled near break-even. Its own report (`docs/bao_cao_preprocessing.md`)
+diagnosed three ceilings:
+
+| Limitation in upgrade-2 | Fixed in upgrade-3 by |
+|---|---|
+| Trained against **one** frozen analyzer → edit overfits that network | **A1** multi-teacher panel + held-out generalization test |
+| Bit/edit budget spent **uniformly** → cutting background also blurs the object | **A2** task-importance spatial mask |
+| Trained **entirely** through a mismatched proxy → poor transfer to real x26x | **A3** real-codec-in-the-loop calibration + soft→hard quant anneal |
+
+## The three contributions
+
+### A1 — Universal, analyzer-agnostic preprocessor (headline)
+`src/tasks/multi_teacher.py`, `src/tasks/base.py::build_analyzer`
+
+Instead of a single frozen analyzer, the preprocessor is trained against a **panel
+of frozen teachers** (`task.teachers`, e.g. `r3d_18` + `mc3_18`). Each step either
+averages the task loss over all teachers (`mean`) or samples one teacher
+(`sample`, a stochastic-multi-teacher regularizer that stops the edit from
+specializing to a single network). Feature distillation follows the *active*
+teacher so it stays coherent within a step.
+
+The generalization claim is then measured against a **held-out analyzer that is
+never in the panel** (`eval.held_out_backbone`, e.g. `r2plus1d_18`). Standard-codec
+preprocessing works (Lu et al. 2206.05650) only show *narrow* same-family transfer;
+learned-codec works that do prove broad held-out transfer (**UG-ICM**,
+arXiv:2501.04579; **All-in-One Transfer**, arXiv:2504.12997) retrain the codec.
+"Universal preprocessing proven on a broad held-out analyzer *with the standard
+codec left frozen*" is the open niche this repo targets. Multi-teacher aggregation
+follows multi-teacher distillation (arXiv:2510.18680) and the feature-modulation
+multi-task preprocessor of **Yang et al., TCSVT 2024** (DOI 10.1109/TCSVT.2023.3348995).
+
+### A2 — Task-importance spatial mask
+`src/models/task_mask.py`, `src/losses.py`
+
+A **gradient-saliency** map of the task loss w.r.t. the input, `m = |∂L_task/∂x|`,
+computed with one extra backward through the frozen teacher and then **detached**.
+It *spatially reweights* the edit (`delta`) and total-variation (`gamma`) penalties
+by `1 − m`, so the preprocessor smooths and stops spending bits on **background**
+while sparing the object the machine needs. This is the pixel-domain, differentiable
+analogue of task-driven bit allocation — cf. **Reinforced Bit Allocation**
+(arXiv:1910.07392), **feature-preserving RDO** (arXiv:2504.02216), and **ROI
+retargeting for machines** (EURASIP JIVP 2025, DOI 10.1186/s13640-025-00682-3) —
+but without touching the encoder. It turns upgrade-2's *global* in-domain↔transfer
+knob (`gamma`) into a *spatial* one.
+
+### A3 — Real-codec calibration (proxy → real transfer)
+`src/models/ste_codec.py`, `src/models/virtual_codec.py`
+
+Two mechanisms that close the proxy→real gap that capped upgrade-2's transfer:
+
+1. **Straight-through real codec.** `STECodec` runs the *real* x264/x265 in the
+   forward pass and borrows the differentiable proxy's gradient in the backward
+   pass: `x̂ = x_proxy + (x_real − x_proxy).detach()`, and likewise for bpp. The
+   loss the optimizer sees is computed on the **true** reconstruction and **true**
+   coded rate. This is the single most reliable transfer recipe in the literature:
+   **Lu et al. (arXiv:2206.05650 / TCSVT 2024)** measured forward-real-codec at
+   −20.3 % BD-Rate vs −14.6 % for a proxy used in both directions. (ffmpeg-per-step
+   is slow → used as a short **calibration fine-tune** on top of a proxy-pretrained
+   checkpoint; see the two-stage recipe below.)
+2. **Soft→hard quantizer annealing.** The block-DCT virtual codec anneals its
+   training quantizer from additive-uniform noise (soft) to straight-through hard
+   rounding (`codec.anneal: 1.0`), so the proxy ends at the codec's real hard
+   quantizer — cf. the soft-quantizer α→∞ schedule of **J4D** (arXiv:2606.16185).
+
+The block-DCT proxy geometry itself (vs a learned wavelet proxy) follows Zhao et al.
+2512.15331 and **Sandwiched Compression** (arXiv:2402.05887); the virtual-codec +
+straight-through idea traces to **DPP** (Chadha & Andreopoulos, CVPR 2021) and the
+differentiable-JPEG proxy of **Talebi et al.** ("Better Compression with Deep
+Pre-Editing," IEEE TIP 2021).
+
+---
+
+## Repository layout
+
+```
+src/
+  models/
+    preprocessor.py    U-Net + FiLM(rate) + SFT(motion) pixel editor (trained)
+    virtual_codec.py   differentiable block-DCT proxy (+ A3 soft→hard anneal)
+    codec.py           CompressAI learned proxy (alternative training codec)
+    ste_codec.py       A3 straight-through real-codec wrapper
+    task_mask.py       A2 gradient-saliency importance map + masked TV
+  tasks/
+    base.py            TaskAnalyzer interface + build_task / build_analyzer
+    multi_teacher.py   A1 frozen-teacher panel
+    action_recognition.py  Kinetics-400 video classifiers (r3d_18/mc3_18/r2plus1d_18)
+    tracking.py, siamfc.py, pytracking_adapter.py  GOT-10k tracking task
+  codecs/standard.py   real x264/x265 via ffmpeg (honest coded bpp)
+  losses.py            L_task + ω·L_distill + β·bpp + τ·L_temp (+ δ,γ masked) (+ μ·L_D)
+  metrics/bd_rate.py   Bjøntegaard BD-Rate/BD-accuracy on the rate–accuracy curve
+  engine.py            train / eval loop, rate conditioning, 6-pipeline BD-Rate
+configs/
+  universal_action_recognition.yaml   A1+A2+A3 headline config
+  action_recognition.yaml, tracking.yaml   single-analyzer baselines
+docs/MODEL.md, docs/IMPROVEMENTS.md, docs/KAGGLE.md
+kaggle/   ready-to-run Kaggle notebook + launcher
+```
+
+Every non-trivial module has a `__main__` self-check (`python -m src.models.virtual_codec`,
+`python -m src.tasks.multi_teacher`, `python -m src.models.task_mask`,
+`python -m src.models.ste_codec`, `python -m src.metrics.bd_rate`).
+
+---
+
+## Quickstart
+
+### Kaggle one-shot
+
+Attach `rohanmallick/kinetics-train-5per`, enable GPU + Internet, then run one cell:
 
 ```bash
-!git clone https://github.com/wagur1/preprocessing_upgrade_5.git /kaggle/working/preprocessing_upgrade_5
-%cd /kaggle/working/preprocessing_upgrade_5
-!pip install -e ".[image]"
-!python kaggle/run_kaggle_vcm.py --data /kaggle/input/kinetics400-5per --videos 8
+%%bash
+set -euo pipefail
+cd /kaggle/working
+if [ -d pre_processing_upgrade_3/.git ]; then
+  git -C pre_processing_upgrade_3 pull --ff-only
+else
+  git clone -q https://github.com/wagur1/pre_processing_upgrade_3.git
+fi
+cd pre_processing_upgrade_3
+bash kaggle/run.sh
 ```
 
-Nếu tên dataset của bạn khác, tìm thư mục thực tế bằng:
+`kaggle/run.sh` detects the mounted Kinetics directory and rebuilds legacy indexes
+that do not contain the independent `test` split.
+
+### Manual run
 
 ```bash
-!find /kaggle/input -maxdepth 2 -type f -name "*.mp4" | head
+pip install -r requirements.txt          # torch, torchvision, compressai, opencv, ffmpeg on PATH
+
+# 1) build a data index (see docs/KAGGLE.md for Kinetics / GOT-10k prep)
+python -m src.data.prepare_3gb   --help
+python -m src.data.prepare_got10k --help
+
+# 2a) STAGE 1 — proxy pretrain (fast, differentiable block-DCT proxy)
+python train.py --config configs/universal_action_recognition.yaml \
+    data.index=data/index/kinetics_3gb.json train.epochs=5
+
+# 2b) STAGE 2 — real-codec calibration fine-tune (A3; short, ffmpeg-in-the-loop)
+python train.py --config configs/universal_action_recognition.yaml \
+    data.index=data/index/kinetics_3gb.json \
+    codec.kind=ste codec.ste_codec=h265 train.finetune=true train.resume=false \
+    train.epochs=6 train.lr=3e-5           # a few hundred extra steps
+
+# 3) evaluate on a HELD-OUT analyzer, real x264/x265 anchors, BD-Rate
+python evaluate.py --config configs/universal_action_recognition.yaml \
+    --ckpt outputs/checkpoints/preprocessor.pth \
+    data.index=data/index/kinetics_3gb.json eval.split=test eval.held_out_backbone=r2plus1d_18
 ```
 
-Script `kaggle/run_kaggle_vcm.py` sẽ:
+The preprocessor checkpoint stores **only** the preprocessor weights, so it is
+codec-agnostic: evaluate the same checkpoint against any codec by changing
+`codec.kind` / the anchor list. Outputs (`results.json`, `curves.csv`,
+`rate_accuracy.png`, `qualitative.png`) land in `outputs/eval/`.
 
-1. Tìm các video MP4 trong thư mục dataset và lấy tối đa `--videos` video đầu tiên.
-2. Encode mỗi video bằng H.264 `libx264` ở QP 22, 27, 32, 37.
-3. Tạo nhánh preprocessing mẫu bằng `hqdn3d + eq + unsharp` rồi encode cùng QP.
-4. Đo bitrate, PSNR và SSIM xấp xỉ trên các frame mẫu.
-5. Tính BD-rate. Giá trị âm nghĩa là tiết kiệm bitrate so với baseline.
+With `eval.per_sequence: true` (the default action-recognition setting), the
+evaluator also writes `sequence_points.csv`, `sequence_bd_rate.csv`, and
+`sequence_bd_rate.json`. These contain the five QP points and same-codec
+`prep+h264 vs h264` / `prep+h265 vs h265` BD-Rate for each held-out video.
+Per-video `top1` is retained as a binary diagnostic; because a binary value
+does not provide a useful five-point curve for most individual videos, the
+per-sequence BD fit uses `target_prob`, the frozen analyzer's probability for
+the ground-truth class. The aggregate headline remains BD-Rate on dataset
+top-1 accuracy.
 
-Kết quả được ghi vào `/kaggle/working/vcm_results.json`. Đây là **smoke benchmark** để kiểm tra pipeline. PSNR/SSIM chỉ là proxy thị giác; kết quả VCM cần thay hàm `quality()` bằng đầu ra model AI (mAP, mIoU, HOTA...) trên nhãn tương ứng.
+---
 
-## Metric nên tối ưu
+## Evaluation protocol & metric
 
-| Tác vụ | Metric chính | Metric bổ trợ |
-|---|---|---|
-| Detection | mAP@0.5, mAP@[.5:.95] | Recall@N, precision |
-| Segmentation | mIoU, Dice/F1 | Boundary F-score |
-| Tracking | HOTA, IDF1 | Số ID switch, MOTA |
-| Re-identification | mAP, Rank-1/5 | CMC curve |
-| Pose/keypoint | OKS-mAP, PCK | AP theo từng khớp |
-| Perception tổng quát | Cosine embedding/CLIP | Top-k accuracy |
-| Chất lượng ảnh | VMAF, MS-SSIM, PSNR-Y | SSIM-Y |
+`src/metrics/bd_rate.py` computes **BD-Rate with machine accuracy as the quality
+axis** (top-1 for recognition, success-plot AUC for tracking) instead of PSNR,
+integrating `log(rate)` over the overlapping accuracy range (Bjøntegaard). By
+default, evaluation traces `prep+{x264,x265}` vs bare `{x264,x265}` and reports:
 
-Metric chính nên là metric AI của tác vụ. PSNR hoặc SSIM có thể tăng nhưng mAP giảm nếu preprocessing làm mất cạnh, texture hoặc chi tiết nhỏ quan trọng với model.
+* **`bd_prep_gain`** — same-codec preprocessor gain (`prep+x265 vs x265`, …). **The real claim.**
+* `bd_vs_anchor` — cross-codec (reference only; QP not comparable across codecs).
 
-## BD-rate và tối ưu đa mục tiêu
+Set `eval.include_proxy=true` to add virtual/CompressAI diagnostic curves.
 
-Mỗi cấu hình preprocessing phải được đánh giá ở cùng tập QP hoặc bitrate để tạo các điểm `(bitrate_kbps, task_quality)`. `bd_rate(reference, test)` fit đa thức bậc hai trên `ln(bitrate)` theo quality rồi tích phân trên miền giao nhau. Kết quả âm, ví dụ `-18.4%`, nghĩa là cần ít bitrate hơn để đạt cùng chất lượng. `bd_quality` đo mức tăng quality tại cùng bitrate.
+Negative BD-Rate = fewer bits at equal accuracy. See [`docs/MODEL.md`](docs/MODEL.md)
+for the full architecture and [`docs/IMPROVEMENTS.md`](docs/IMPROVEMENTS.md) for the
+line-by-line delta vs the baseline and upgrade-2.
 
-Với một operating point, `RandomSearch` tối ưu `w_quality * task_quality - w_rate * log(1 + bitrate_kbps)`. Với toàn bộ đường cong RD, dùng `BDRateSearch` để tối thiểu hóa BD-rate trực tiếp. Khi benchmark thực tế nên theo dõi thêm latency (ms/frame), bộ nhớ, năng lượng và độ ổn định theo video.
+---
 
-## Cài đặt và API
+## Datasets
 
-```bash
-pip install -e ".[image]"
-```
+* **Kinetics-400** (Kay et al., 2017) — action recognition; frozen torchvision
+  video ResNets carry the canonical 400-class ordering.
+* **GOT-10k** (Huang et al., TPAMI 2021) — single-object tracking; success-plot
+  AUC / AO / SR. Default tracker is a self-contained SiamFC; the paper's exact
+  KYS/DiMP/ATOM/PrDiMP run via `pytracking` (`scripts/install_pytracking.sh`).
 
-```python
-from vcm_preprocess import PreprocessConfig, preprocess_sequence, RandomSearch, BDRateSearch
-preprocess_sequence("frames", "frames_pp", PreprocessConfig())
+## Reproducibility notes
 
-def evaluator(config):
-    # preprocess -> encode/decode -> chạy model AI
-    return {"task_quality": 0.72, "bitrate_kbps": 500}
+* This repo is a **research harness**, not a set of frozen numbers. BD-Rate on a
+  small Kinetics subset fluctuates ±3–4 % per seed — run 3–5 seeds and report a CI
+  (`kaggle/report_ci.py`). Effect size and significance grow with data, not with
+  architecture; A1/A2/A3 raise the *ceiling* and *robustness*, seeds establish
+  *significance*.
+* ffmpeg with `libx264` + `libx265` must be on `PATH` for the real-codec anchors
+  and for the A3 STE stage (preinstalled on Kaggle).
 
-result = RandomSearch(evaluator, iterations=100, seed=7).run()
-print(result.config, result.metrics)
-```
+## Citations
 
-Tối ưu trực tiếp BD-rate:
-
-```python
-reference = [(120, .55), (220, .63), (410, .70), (820, .75)]
-def rd_evaluator(config):
-    return [(110, .55), (205, .63), (390, .70), (790, .75)]
-result = BDRateSearch(reference, rd_evaluator, iterations=100).run()
-print(result.metrics["bd_rate_percent"])
-```
-
-CLI xử lý một thư mục frame: `vcm-preprocess frames/ frames_pp/ --config config.json`.
-
-## Quy trình benchmark đề xuất
-
-1. Chia train/validation/test theo **video**, không trộn frame giữa các tập.
-2. Giữ cố định codec, preset, GOP, độ phân giải, chroma format và các QP (thường 22/27/32/37).
-3. Đo bitrate trung bình, metric AI trên toàn bộ frame, latency preprocessing + decode + inference.
-4. Tính BD-rate trên metric AI; báo cáo thêm BD-rate theo VMAF/PSNR-Y để phát hiện suy giảm thị giác.
-5. Chọn các điểm Pareto và chỉ xác nhận một lần trên test set.
-
-## Ghi chú
-
-- Yêu cầu Python 3.10+. Pillow là dependency tùy chọn; metric và optimizer dùng Python standard library.
-- `denoise`, `sharpen` nằm trong [0, 1]; `contrast` [0.8, 1.3]; `saturation` [0.7, 1.3]; `luma_gain` [0.85, 1.15].
-- Pipeline hiện tại là baseline CPU, không phải learned preprocessor. Có thể thay `preprocess_image` bằng mô hình ONNX/TensorRT mà không đổi evaluator và optimizer.
-- BD-rate không có ý nghĩa nếu hai đường RD không có miền quality giao nhau; hàm sẽ báo lỗi để tránh kết quả sai.
-
-## Kiểm thử
-
-```bash
-python -m pytest -q
-```
-
-## Recipe khuyến nghị để tối ưu transfer
-
-`configs/robust_transfer.yaml` là preset cho đường cong RD ổn định hơn: proxy
-block-DCT dùng closed-loop P-frame references, `qp_per_step=3` tối ưu đồng thời
-nhiều operating points, và loss giữ task-mask + TV. Sau stage 1, có thể fine-tune
-STE với `codec.kind=ste codec.ste_codec=both codec.ste_eval_codec=h265` để lấy mẫu
-H.264/H.265 trong forward; khi đánh giá nên chạy riêng `ste_eval_codec=h264` và
-`h265` để báo cáo hai anchor cùng protocol.
+Full BibTeX-style reference list in [`docs/IMPROVEMENTS.md`](docs/IMPROVEMENTS.md#references).
+Key sources: Zhao et al. arXiv:2512.15331 (baseline); Lu et al. arXiv:2206.05650 /
+TCSVT 2024 (A3 recipe, analyzer-agnostic motivation); Yang et al. TCSVT 2024
+(feature-modulation multi-task preprocessor); FiLM (Perez et al. 2018); SFT (Wang
+et al. CVPR 2018); DPP (Chadha & Andreopoulos CVPR 2021); Talebi et al. TIP 2021;
+J4D arXiv:2606.16185; UG-ICM arXiv:2501.04579; multi-teacher distillation
+arXiv:2510.18680; task-driven bit allocation arXiv:1910.07392 & arXiv:2504.02216.

@@ -18,7 +18,7 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Tuple
+from typing import List, Tuple
 
 import numpy as np
 import torch
@@ -113,10 +113,10 @@ class StandardCodec:
 
     # -- batch of clips ----------------------------------------------------
     @torch.no_grad()
-    def compress_decompress(
+    def compress_decompress_items(
         self, x: torch.Tensor, qp: int | None = None
-    ) -> Tuple[torch.Tensor, float]:
-        """Encode a batch, optionally overriding the configured QP for this call."""
+    ) -> Tuple[torch.Tensor, List[float]]:
+        """Encode a batch and return the real bpp of every input sequence."""
         b, c, t, h, w = x.shape
         arr = (x.clamp(0, 1) * 255).round().byte().cpu().numpy()  # [B,C,T,H,W]
         recons = []
@@ -127,4 +127,12 @@ class StandardCodec:
             recons.append(np.transpose(rec, (3, 0, 1, 2)))  # [C,T,H,W]
             bpps.append(bpp)
         out = torch.from_numpy(np.stack(recons)).float().div_(255.0).to(x.device)
+        return out, [float(v) for v in bpps]
+
+    @torch.no_grad()
+    def compress_decompress(
+        self, x: torch.Tensor, qp: int | None = None
+    ) -> Tuple[torch.Tensor, float]:
+        """Encode a batch and return its mean bpp (backward-compatible API)."""
+        out, bpps = self.compress_decompress_items(x, qp=qp)
         return out, float(np.mean(bpps))

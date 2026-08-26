@@ -103,6 +103,16 @@ Reads `outputs/eval/`:
   `bd_vs_anchor` (cross-codec, reference only).
 * `curves.csv`, `rate_accuracy.png`, `qualitative.png`.
 
+When `eval.per_sequence=true`, evaluation additionally writes
+`sequence_points.csv`, `sequence_bd_rate.csv`, and `sequence_bd_rate.json`.
+These contain the five QP points and same-codec BD-Rate for every held-out
+video. Per-video `top1` remains a binary diagnostic; per-sequence BD fitting
+uses `target_prob` (ground-truth class probability) as the continuous quality
+metric. Aggregate headline BD-Rate still uses dataset top-1 accuracy.
+
+Proxy curves are omitted by default because the paper claim uses real H.264/H.265.
+Set `eval.include_proxy=true` only for virtual-codec diagnostics.
+
 Evaluation defaults to the independent `test` split. Set `eval.split=val` only for
 diagnostics, and set `eval.held_out_backbone=null` to evaluate in-domain (`r3d_18`).
 
