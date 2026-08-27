@@ -46,7 +46,14 @@ class _Comet:
     def __init__(self, exp: Any, out_dir: Path, name: str) -> None:
         self._exp = exp
         self._name = name
-        self._key = getattr(exp, "id", None)
+        self._key = None
+        getter = getattr(exp, "get_key", None)  # comet_ml's documented accessor
+        if callable(getter):
+            try:
+                self._key = getter()
+            except Exception:
+                self._key = None
+        self._key = self._key or getattr(exp, "id", None)
         try:  # persist for evaluate()'s attach pass
             out_dir.mkdir(parents=True, exist_ok=True)
             (out_dir / KEY_FILE).write_text(str(self._key), encoding="utf-8")
