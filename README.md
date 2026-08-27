@@ -291,6 +291,26 @@ line-by-line delta vs the baseline and upgrade-2.
 * ffmpeg with `libx264` + `libx265` must be on `PATH` for the real-codec anchors
   and for the A3 STE stage (preinstalled on Kaggle).
 
+## Experiment tracking (Comet ML)
+
+Optional, environment-driven, zero behaviour change when off. `train.py` and
+`evaluate.py` push live loss curves, per-epoch validation, and the final
+BD metrics to a [Comet](https://comet.com) dashboard whenever these variables
+are set (`src/tracking.py`):
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `COMET_API_KEY` | — | **presence enables tracking**; absent → silent no-op |
+| `COMET_PROJECT_NAME` | `vcm-preprocessing` | project on Comet |
+| `COMET_WORKSPACE` | account default | workspace on Comet |
+| `COMET_EXPERIMENT_NAME` | derived from `out_dir` (e.g. `sweep_51-seed_0-mu3`) | experiment name |
+| `COMET_MODE` | `online` | `offline` / `disabled` |
+
+`train` writes its experiment key to `<out_dir>/comet_key.txt`, so the later
+`evaluate` run **attaches its BD numbers to the same experiment** instead of
+spawning a new one. On Kaggle, store the key as a notebook secret
+(Add-ons → Secrets, label `COMET_API_KEY`) and `pip install comet_ml`.
+
 ## Citations
 
 Full BibTeX-style reference list in [`docs/IMPROVEMENTS.md`](docs/IMPROVEMENTS.md#references).

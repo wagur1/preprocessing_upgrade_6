@@ -58,6 +58,7 @@ from .models import CompressAICodec, STECodec, VideoPreprocessor, VirtualCodec
 from .models.task_mask import task_saliency
 from .tasks import build_task
 from .tasks.base import build_analyzer
+from .tracking import attach_tracker, make_tracker
 
 
 # --------------------------------------------------------------------------
@@ -359,6 +360,10 @@ def _fit(cfg, pre, codec, analyzer, train_loader, val_loader, prep_batch,
     print(f"[train] {tag} | {n_train} clips | {len(train_loader)} steps/epoch | "
           f"val={'yes' if val_loader else 'none'} | cosine={use_cosine} | "
           f"patience={patience or 'off'} | device={device}", flush=True)
+    tracker = make_tracker(Path(cfg.get("out_dir", "outputs")),
+                           fallback_name=f"{tag}-seed{cfg.get('seed', 0)}")
+    tracker.log_params({"tag": tag, "n_train": n_train, "total_steps": total_steps,
+                        "finetune": finetune, "config": cfg})
 
     stop, epoch = False, start_epoch
     # A3: soft->hard quantiser anneal target for the differentiable proxy (0=off).
@@ -404,14 +409,17 @@ def _fit(cfg, pre, codec, analyzer, train_loader, val_loader, prep_batch,
             if sched is not None:
                 sched.step()
             step += 1
-            pbar.set_postfix(loss=f"{parts['loss'].item():.3f}",
-                             task=f"{parts['loss_task'].item():.3f}",
-                             dist=f"{parts['loss_dist'].item():.3f}",
-                             bpp=f"{parts['loss_rate'].item():.3f}",
-                             tmp=f"{parts['loss_temp'].item():.4f}",
-                             dlt=f"{parts['loss_delta'].item():.4f}",
-                             tv=f"{parts['loss_tv'].item():.4f}",
-                             lr=f"{opt.param_groups[0]['lr']:.1e}", qp=qp)
+            vals = {k: v.item() for k, v in parts.items()}
+            lr_now = opt.param_groups[0]["lr"]
+            pbar.set_postfix(loss=f"{vals['loss']:.3f}",
+                             task=f"{vals['loss_task']:.3f}",
+                             dist=f"{vals['loss_dist']:.3f}",
+                             bpp=f"{vals['loss_rate']:.3f}",
+                             tmp=f"{vals['loss_temp']:.4f}",
+                             dlt=f"{vals['loss_delta']:.4f}",
+                             tv=f"{vals['loss_tv']:.4f}",
+                             lr=f"{lr_now:.1e}", qp=qp)
+            tracker.log_step(step, {**vals, "lr": lr_now, "qp": qp})
             if max_steps and step >= max_steps:
                 stop = True
                 break
@@ -426,6 +434,8 @@ def _fit(cfg, pre, codec, analyzer, train_loader, val_loader, prep_batch,
                 vl, best_val, min_delta, no_improve, patience)
             print(f"[train] epoch {epoch + 1} val_loss={vl:.4f} best={best_val:.4f} "
                   f"{'*improved' if improved else f'(no_improve={no_improve})'}", flush=True)
+            tracker.log_epoch(epoch + 1, {"val_loss": vl, "best_val": best_val,
+                                          "no_improve": no_improve})
             if improved:
                 _save(ckpt_path, epoch + 1)
             elif stop_es:
@@ -436,6 +446,10 @@ def _fit(cfg, pre, codec, analyzer, train_loader, val_loader, prep_batch,
 
     if val_loader is None or not ckpt_path.exists():
         _save(ckpt_path, epoch + 1)
+    final = {"steps": step, "epochs_done": epoch + 1}
+    if best_val != float("inf"):
+        final["best_val"] = best_val
+    tracker.finish(final)
     print(f"[train] best checkpoint -> {ckpt_path}")
     return str(ckpt_path)
 
@@ -904,6 +918,23 @@ def _finalize(curves: dict, out_dir: Path, task: str, metric: str, n_eval: int,
     _write_csv(out_dir / "curves.csv", curves)
     _plot(out_dir / "rate_accuracy.png", curves, metric)
     _print_summary(results)
+    tracker = attach_tracker(out_dir, fallback_name=f"{task}-eval")
+    for pair, g in (results.get("bd_prep_gain") or {}).items():
+        tracker.log_eval({f"bd_rate_pct/{pair}": g.get("bd_rate_pct"),
+                          f"bd_accuracy/{pair}": g.get("bd_accuracy")})
+    for method, c in curves.items():
+        tracker.log_curve(f"rate-accuracy/{method}", c.get("bpp", []), c.get("accuracy", []))
+    for codec in ("h264", "h265"):
+        a, p_ = curves.get(codec), curves.get(f"prep+{codec}")
+        if not a or not p_ or not a.get("keys"):
+            continue
+        tracker.log_eval({
+            f"qp_gap_first/{codec}": p_["accuracy"][0] - a["accuracy"][0],
+            f"qp_gap_last/{codec}": p_["accuracy"][-1] - a["accuracy"][-1],
+            f"bpp_div/{codec}": sum(abs(x - y) / y for x, y in zip(p_["bpp"], a["bpp"]))
+                                / max(len(a["bpp"]), 1),
+        })
+    tracker.finish({"n_eval": n_eval})
     print(f"[eval] wrote {out_dir/'results.json'}, curves.csv, rate_accuracy.png")
     return results
 

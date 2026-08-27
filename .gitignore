@@ -21,4 +21,5 @@ results/
 
 # Scratch
 _paper_text.txt
+.comet/
 .DS_Store
