@@ -114,7 +114,8 @@ class _UNet(nn.Module):
 
 
 class VideoPreprocessor(nn.Module):
-    """Rate- and motion-conditioned U-Net preprocessor.
+    """Rate- and motion-conditioned U-Net preprocessor with structural saliency
+    gating (upgrade-6, contribution D1).
 
     Args:
         in_ch:    input channels (3 for RGB).
@@ -122,16 +123,26 @@ class VideoPreprocessor(nn.Module):
         res_scale: scales the learned residual before adding to the input.
         cond_dim: rate condition width (1 = normalised QP; sized for later
                   appending an explicit log target-rate for rate control).
+        gate:     when True and a task-saliency ``mask`` is supplied to
+                  :meth:`forward`, the pixel edit is scaled by ``(1 - mask)``:
+                  ``x_pre = x + (1 - M) * edit``. Task-critical pixels (M=1)
+                  become an EXACT identity by construction -- accuracy at light
+                  QPs can no longer be traded away by any loss term, the failure
+                  mode that ended upgrade-5.1 (11 loss variants, all failing
+                  the QP30-gap selection; the gate removes the trade-off from
+                  the optimisation's reach entirely).
     """
 
     def __init__(self, in_ch: int = 3, base_ch: int = 32, res_scale: float = 1.0,
-                 cond_dim: int = 1, max_relative_edit: float = 0.25):
+                 cond_dim: int = 1, max_relative_edit: float = 0.25,
+                 gate: bool = True):
         super().__init__()
         if not 0.0 < max_relative_edit <= 1.0:
             raise ValueError("max_relative_edit must be in (0, 1]")
         self.cond_dim = cond_dim
         self.res_scale = res_scale
         self.max_relative_edit = max_relative_edit
+        self.gate = gate
         self.unet = _UNet(in_ch, base_ch, cond_dim)
 
     @staticmethod
@@ -157,9 +168,13 @@ class VideoPreprocessor(nn.Module):
         n, c, h, w = x.shape
         return x.reshape(b, t, c, h, w).permute(0, 2, 1, 3, 4)
 
-    def forward(self, x: torch.Tensor, cond: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, cond: torch.Tensor | None = None,
+                mask: torch.Tensor | None = None) -> torch.Tensor:
         """x: [B,C,T,H,W] in [0,1]. cond: [B, cond_dim] operating point (defaults
-        to zeros = top quality). Returns edited video in [0,1]."""
+        to zeros = top quality). mask: optional detached [B,1,T,H,W] saliency in
+        [0,1] (1 = task-critical). When the gate is enabled and a mask is given,
+        the edit is scaled by (1 - mask) so task-critical pixels pass through
+        unmodified. Returns edited video in [0,1]."""
         if x.ndim != 5 or x.shape[1] != 3:
             raise ValueError(f"expected [B,3,T,H,W], got {tuple(x.shape)}")
         b, c, t, h, w = x.shape
@@ -178,4 +193,12 @@ class VideoPreprocessor(nn.Module):
         positive = delta.clamp_min(0.0) * (1.0 - frames)
         negative = delta.clamp_max(0.0) * frames
         out = frames + self.max_relative_edit * (positive + negative)
+        if self.gate and mask is not None:
+            # D1: structural saliency gating. Scale the *edit*, not the pixels:
+            # mask=1 -> exact identity regardless of what the loss wants.
+            mask_f, _ = self._fold(mask.to(frames.dtype))
+            if mask_f.shape[-2:] != frames.shape[-2:]:
+                mask_f = F.interpolate(mask_f, size=frames.shape[-2:],
+                                       mode="bilinear", align_corners=False)
+            out = frames + (1.0 - mask_f) * (out - frames)
         return self._unfold(out, bt)

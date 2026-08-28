@@ -1,4 +1,4 @@
-# preprocessing_upgrade_5.1
+# preprocessing_upgrade_6
 
 **Universal, analyzer-agnostic video preprocessing for Video Coding for Machines (VCM), in front of a *frozen* standard codec (x264 / x265).**
 
@@ -7,22 +7,20 @@ vision model ("analyzer") stay frozen and standard — no bitstream changes, no
 decoder changes, no per-CTU QP maps. The preprocessor edits pixels *before*
 encoding so that, at the same bitrate, a machine still sees what it needs.
 
-> 🇻🇳 **Tóm tắt.** Đây là bản nâng cấp 5.1 của pipeline tiền xử lý VCM. Chỉ huấn
-> luyện *preprocessor* đặt **trước** một codec tiêu chuẩn (x264/x265) **đóng
-> băng**; codec và mạng phân tích (analyzer) không đổi. So với upgrade-3 (A1
-> multi-teacher, A2 task-mask, A3 STE real-codec calibration — giữ nguyên),
-> bản 5.1 thêm hai đóng góp nhắm thẳng vào khoảng cách proxy→codec-thật còn
-> lại: **(C1)** proxy codec mô phỏng đúng **colorspace YCbCr 4:2:0** của
-> x264/x265 (BT.601 + subsample chroma 2× + lượng tử chroma thô hơn) và
-> **(C2)** **in-grid QP protocol** — train đúng các điểm QP đánh giá
-> [30, 35, 40, 45, 50]. Hướng dẫn chạy trên Kaggle: [`docs/KAGGLE.md`](docs/KAGGLE.md).
+> 🇻🇳 **Tóm tắt.** Bản nâng cấp 6 của pipeline tiền xử lý VCM. Chỉ huấn luyện
+> *preprocessor* đặt **trước** codec tiêu chuẩn (x264/x265) **đóng băng**.
+> Toàn bộ hạ tầng 5.1 (A1 multi-teacher, A2 task-mask, A3 STE, C1 yuv420 proxy,
+> C2 in-grid QP) được giữ nguyên. Đóng góp mới **(D1) structural saliency
+> gating**: edit pixel bị nhân với `(1 − M)` theo saliency của analyzer đóng
+> băng — `x_pre = x + (1 − M)·edit` — nên **vùng task-critical là identity
+> chính xác theo cấu trúc**, không loss nào đổi được accuracy của nó lấy rate.
 
 ```
                      (trained)              (FROZEN)                 (FROZEN panel)
  video x ─► Preprocessor θ ─► x_pre ─► Standard codec ─► x̂ ─► Analyzer(s) ─► machine label
             U-Net + FiLM(rate)          x264 / x265                r3d_18 / mc3_18 / …
             + SFT(motion)               (yuv420 proxy at train)    + a HELD-OUT analyzer at eval
-            + task-mask (A2)
+            + D1 GATE: edit *= (1-M)    M = task saliency of the frozen analyzer
 ```
 
 The claim we optimize is the **preprocessor gain on the *same* codec**:
@@ -32,6 +30,53 @@ comparisons are reported too, but QP is not comparable across codecs, so they ar
 reference-only.)
 
 ---
+
+## Why upgrade-6 (what ended upgrade-5.1)
+
+5.1's first two full 3-seed runs came out **negative** (`prep+h264 +2.1 %`,
+`prep+h265 +3.2 %`; replicated +9.6 %/+12.2 % — STE stage flips between
+near-identity and kept-destructive per seed). A systematic 11-variant
+loss-weight campaign (2026-08-27/28, single seed, Stage-1 only) then mapped the
+whole reachable space:
+
+| variant | change | mean QP30-gap | outcome |
+|---|---|---|---|
+| control | μ=10, λ_task=1, β=0.01 | −0.310 | pathology: edits cut bpp by destroying ~30 acc points at QP30 |
+| mu3 / task3 / beta003 | μ→3 / λ_task→3 / β→0.003 | −0.254 / −0.333 / −0.295 | no single knob closes the gap |
+| flatkill (γ=δ=0) | remove flattening pressures | −0.321 | not the cause |
+| **distill2 (ω=2)** | raise distillation | **−0.213** | best of all; still fails −0.05 |
+| distill5 (ω=5) | distillation saturation | −0.305 | ω peaks at 2 |
+| noqp50 (drop QP50 from train) | curriculum | −0.317 | dead-QP curriculum doesn't rescue |
+| zhao-bridge (μ=10, β=0.001, γ=δ=0 — the paper's exact loss) | transfer test | −0.298, BD +87 %/+60 % | **Zhao's loss does not transfer to our infra** |
+
+Two mechanisms were established: (i) the task cross-entropy **dies to random-guess**
+under proxy-codec damage at heavy QPs (train logs: task ≈ ln 400), so during most
+of training there is *no accuracy-preserving gradient*; (ii) with no live task
+signal, the remaining pressures steer the edit into "cheap for the codec, unreadable
+for the analyzer". Every loss-side fix was tried and failed ⇒ the failure is
+**structural**.
+
+**D1 removes the failure mode by construction.** The edit is gated per-pixel by the
+frozen analyzer's saliency: task-critical pixels are an exact identity — no loss
+term can trade their accuracy for rate — and the network is free to spend its
+creativity on the background, where bits are wasted anyway. This is the
+pixel-domain analogue of prompt-guided prefiltering (Azizian & Bajić, ICME 2026,
+arXiv:2604.00314: keep task-relevant regions, smooth the rest, 25–50 % savings
+with unchanged accuracy) and inherits the A2 saliency machinery already in the
+harness — promoted from a *loss reweighting* (a pressure the optimizer can
+override) to a *forward-pass structure* (which it cannot).
+
+Design invariants:
+
+* loss weights in `configs/universal_action_recognition.yaml` are **identical to
+  5.1** — the gate is the single changed variable, so any delta vs the 11-variant
+  campaign attributes to D1;
+* the mask is **detached** (no second-order gradients), cheap (one extra backward
+  through the frozen analyzer, already computed for A2);
+* at eval the gate mask comes from the **eval analyzer** (held-out backbone) —
+  train/eval consistency, and the honest "universal" reading: protection regions
+  derived from whichever frozen analyzer will consume the stream;
+* `model.gate: false` reproduces 5.1 exactly (ablation arm).
 
 ## Why upgrade-3 (what was limiting upgrade-2)
 

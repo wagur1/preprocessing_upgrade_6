@@ -33,6 +33,15 @@ model:
   res_scale: 1.0
   max_relative_edit: 0.25  # hard safety envelope: one pass cannot erase the clip
   cond_dim: 1
+  # ---- D1 (upgrade-6): structural saliency gating -----------------------------
+  # x_pre = x + (1 - M) * edit, M = frozen-analyzer task saliency in [0,1].
+  # Task-critical pixels become EXACT identity by construction: no loss term
+  # can trade their accuracy for rate. 5.1's 11-variant loss campaign showed
+  # the QP30-gap failure is structural (best mean gap -0.213 with mu=3, omega=2,
+  # never passing -0.05) -- D1 removes the trade-off from optimization entirely.
+  # Loss weights below stay IDENTICAL to 5.1: the gate is the single changed
+  # variable, so any delta vs eval_2/eval_5/eval_10 attributes to D1.
+  gate: true
   qp_ref: [20, 51]
 
 codec:                              # differentiable TRAINING proxy

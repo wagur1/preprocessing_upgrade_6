@@ -86,6 +86,7 @@ def _build_models(cfg: dict, device: torch.device, role: str = "train"):
         res_scale=m.get("res_scale", 1.0),
         cond_dim=m.get("cond_dim", 1),
         max_relative_edit=m.get("max_relative_edit", 0.25),
+        gate=bool(m.get("gate", True)),
     ).to(device)
     cc = cfg["codec"]
     kind = cc.get("kind", "compressai")
@@ -259,7 +260,7 @@ def _val_loss(pre, codec, analyzer, loader, weights, qp_list, qp_to_quality,
                 analyzer.pin_active()
             try:
                 mask = task_saliency(analyzer, clips, target) if weights.use_task_mask else None
-                x_pre = pre(clips, cond)
+                x_pre = pre(clips, cond, mask=mask)
                 x_hat, bpp = codec(x_pre, q)
                 parts = preprocessing_loss(analyzer, clips, x_hat, bpp, target, weights,
                                            x_pre=x_pre, task_mask=mask)
@@ -396,7 +397,7 @@ def _fit(cfg, pre, codec, analyzer, train_loader, val_loader, prep_batch,
                 analyzer.pin_active()
             try:
                 mask = task_saliency(analyzer, clips, target) if weights.use_task_mask else None
-                x_pre = pre(clips, cond)
+                x_pre = pre(clips, cond, mask=mask)
                 x_hat, bpp = codec(x_pre, q)
                 parts = preprocessing_loss(analyzer, clips, x_hat, bpp, target, step_w,
                                            x_pre=x_pre, task_mask=mask)
@@ -616,13 +617,21 @@ def _evaluate_classification(cfg, pre, codec, analyzer, out_dir) -> dict:
             metadata = None
         clips = clips.to(device)
         labels = labels.to(device)
+        # D1: gate the edit at eval too (train/eval consistency). The saliency
+        # comes from the EVAL analyzer (held-out backbone by default) -- the
+        # "universal" reading: protection regions derived from whichever frozen
+        # analyzer will consume the stream.
+        gate_mask = None
+        if bool(cfg.get("model", {}).get("gate", True)) and bool(
+                cfg.get("loss", {}).get("use_task_mask", True)):
+            gate_mask = task_saliency(analyzer, clips, labels)
         # Rate-conditioned: the preprocessor output depends on the operating
         # point, so it is recomputed per rate point (cannot preprocess once).
         if include_proxy:
             for q in codec.qualities:
                 cond = _rate_cond(qconds[q], clips.shape[0], clips.device, clips.dtype)
                 with torch.no_grad():
-                    x_pre = pre(clips, cond)
+                    x_pre = pre(clips, cond, mask=gate_mask)
                 xh, bpp = codec.compress_decompress(x_pre, q)
                 s, n = _task_metric(analyzer, xh, labels)
                 _accumulate(store, prep_proxy_name, q, bpp, s, n)
@@ -637,7 +646,7 @@ def _evaluate_classification(cfg, pre, codec, analyzer, out_dir) -> dict:
                 for qp in qps:
                     cond = _rate_cond(_qp_norm(qp, cfg), clips.shape[0], clips.device, clips.dtype)
                     with torch.no_grad():
-                        x_pre = pre(clips, cond)
+                        x_pre = pre(clips, cond, mask=gate_mask)
                     sc = StandardCodec(codec=name, qp=qp, preset=ev.get("preset", "medium"))
                     xh, bpps = sc.compress_decompress_items(clips)
                     xhp, bppps = sc.compress_decompress_items(x_pre)
