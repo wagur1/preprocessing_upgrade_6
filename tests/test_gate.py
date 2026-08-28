@@ -99,6 +99,48 @@ def test_gate_area() -> None:
     print("gate_area self-check passed")
 
 
+def test_edit_kind_smooth() -> None:
+    torch.manual_seed(2)
+    pre = VideoPreprocessor(base_ch=8, edit_kind="smooth", gate_area=0.5)
+    with torch.no_grad():
+        # make the strength map non-trivial: bias the tail toward positive
+        for p in pre.unet.tail.parameters():
+            p.normal_(0, 0.2)
+        pre.unet.tail.bias.fill_(1.0)
+    x = torch.rand(2, 3, 4, 16, 16)
+    cond = torch.zeros(2, 1)
+
+    out = pre(x, cond)
+    assert out.shape == x.shape
+    assert float(out.min()) >= -1e-6 and float(out.max()) <= 1.0 + 1e-6
+
+    # D3 invariant: output lies BETWEEN x and blur(x) per pixel (convex blend)
+    blur = VideoPreprocessor._gaussian_blur(x)
+    lo = torch.minimum(x, blur) - 1e-6
+    hi = torch.maximum(x, blur) + 1e-6
+    assert torch.all(out >= lo) and torch.all(out <= hi), \
+        "smooth edit must stay inside [x, blur(x)] — cannot add detail"
+
+    # gradient flows
+    x_g = x.clone().requires_grad_(True)
+    out = pre(x_g, cond)
+    out.sum().backward()
+    assert x_g.grad is not None and torch.isfinite(x_g.grad).all()
+
+    # residual mode unchanged (regression): zero-init tail -> exact identity
+    pre_r = VideoPreprocessor(base_ch=8, edit_kind="residual")
+    out_r = pre_r(x, cond)
+    assert torch.allclose(out_r, x, atol=1e-6)
+
+    # gate + smooth compose: mask=1 still exact identity in smooth mode
+    mask1 = torch.ones(2, 1, 4, 16, 16)
+    out_g = pre(x, cond, mask=mask1)
+    assert torch.allclose(out_g, x, atol=1e-6), "gate must force identity in smooth mode too"
+
+    print("edit_kind smooth self-check passed")
+
+
 if __name__ == "__main__":
     test_gate()
     test_gate_area()
+    test_edit_kind_smooth()

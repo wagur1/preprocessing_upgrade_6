@@ -88,6 +88,7 @@ def _build_models(cfg: dict, device: torch.device, role: str = "train"):
         max_relative_edit=m.get("max_relative_edit", 0.25),
         gate=bool(m.get("gate", True)),
         gate_area=float(m.get("gate_area", 0.0)),
+        edit_kind=str(m.get("edit_kind", "residual")),
     ).to(device)
     cc = cfg["codec"]
     kind = cc.get("kind", "compressai")

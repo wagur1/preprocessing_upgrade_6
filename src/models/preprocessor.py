@@ -115,7 +115,7 @@ class _UNet(nn.Module):
 
 class VideoPreprocessor(nn.Module):
     """Rate- and motion-conditioned U-Net preprocessor with structural saliency
-    gating (upgrade-6, contribution D1).
+    gating (upgrade-6, contributions D1/D2/D3).
 
     Args:
         in_ch:    input channels (3 for RGB).
@@ -131,16 +131,30 @@ class VideoPreprocessor(nn.Module):
                   mode that ended upgrade-5.1 (11 loss variants, all failing
                   the QP30-gap selection; the gate removes the trade-off from
                   the optimisation's reach entirely).
+        gate_area: D2 hard mask -- top-`gate_area` fraction of pixels per clip
+                  by saliency is protected with an EXACT identity.
+        edit_kind: "residual" (default, 5.1 behaviour: free bounded pixel edit)
+                  or "smooth" (D3: the U-Net outputs a per-pixel LOW-PASS
+                  STRENGTH in [0,1]; the output is a convex blend
+                  ``x_pre = x + s * (blur(x) - x)``). D2's diagnosis: the
+                  residual edit with mu=10 learns rate-ADDING noise (+5% bpp at
+                  every QP) because MSE-to-source penalises real smoothing;
+                  the smooth parameterisation makes "cheaper than source" the
+                  ONLY possible direction -- blur(x) never adds bits, so
+                  rate-adding edits are architecturally impossible.
     """
 
     def __init__(self, in_ch: int = 3, base_ch: int = 32, res_scale: float = 1.0,
                  cond_dim: int = 1, max_relative_edit: float = 0.25,
-                 gate: bool = True, gate_area: float = 0.0):
+                 gate: bool = True, gate_area: float = 0.0,
+                 edit_kind: str = "residual"):
         super().__init__()
         if not 0.0 < max_relative_edit <= 1.0:
             raise ValueError("max_relative_edit must be in (0, 1]")
         if not 0.0 <= gate_area < 1.0:
             raise ValueError("gate_area must be in [0, 1)")
+        if edit_kind not in ("residual", "smooth"):
+            raise ValueError(f"edit_kind must be 'residual' or 'smooth', got {edit_kind!r}")
         self.cond_dim = cond_dim
         self.res_scale = res_scale
         self.max_relative_edit = max_relative_edit
@@ -152,7 +166,27 @@ class VideoPreprocessor(nn.Module):
         # fraction of pixels PER CLIP by saliency (scale-free): those become an
         # exact identity, everything else is fully editable.
         self.gate_area = gate_area
+        # D3: smoothing-first parameterisation (see class docstring).
+        self.edit_kind = edit_kind
         self.unet = _UNet(in_ch, base_ch, cond_dim)
+
+    @staticmethod
+    def _gaussian_blur(x: torch.Tensor, kernel_size: int = 5, sigma: float = 2.0) -> torch.Tensor:
+        """Differentiable gaussian blur over the last two (H, W) dims.
+
+        Separable 1-D kernels keep it cheap; padding is replicate so border
+        pixels stay statistics-preserving. Accepts [..., C, H, W]."""
+        k = kernel_size
+        coords = torch.arange(k, dtype=x.dtype, device=x.device) - (k - 1) / 2
+        g = torch.exp(-(coords ** 2) / (2 * sigma ** 2))
+        g = (g / g.sum()).view(1, 1, 1, k)
+        lead, c = x.shape[:-3], x.shape[-3]
+        x = x.reshape(-1, c, *x.shape[-2:])
+        gk = g.expand(c, 1, 1, k).reshape(c, 1, 1, k)
+        x = F.conv2d(F.pad(x, (k // 2, k // 2, 0, 0), mode="replicate"), gk, groups=c)
+        gk = g.reshape(1, 1, k, 1).expand(c, 1, k, 1).reshape(c, 1, k, 1)
+        x = F.conv2d(F.pad(x, (0, 0, k // 2, k // 2), mode="replicate"), gk, groups=c)
+        return x.reshape(*lead, c, *x.shape[-2:])
 
     @staticmethod
     def _motion_cue(x: torch.Tensor) -> torch.Tensor:
@@ -193,15 +227,22 @@ class VideoPreprocessor(nn.Module):
         frames, bt = self._fold(x)
         cue_f, _ = self._fold(cue)
         cond_f = cond.repeat_interleave(t, dim=0)  # [B*T, cond_dim]
-        delta = torch.tanh(self.res_scale * self.unet(frames, cond_f, cue_f))
-        # Bound the editor itself, not merely its final pixels. Positive edits
-        # consume a fraction of the distance to white; negative edits consume a
-        # fraction of the source value. This guarantees [0,1], preserves exact
-        # identity at initialization and, crucially, makes an all-black collapse
-        # impossible in one preprocessing pass even if the rate loss dominates.
-        positive = delta.clamp_min(0.0) * (1.0 - frames)
-        negative = delta.clamp_max(0.0) * frames
-        out = frames + self.max_relative_edit * (positive + negative)
+        if self.edit_kind == "smooth":
+            # D3: U-Net outputs a per-pixel low-pass strength in [0,1]; the
+            # frame becomes a convex blend toward its gaussian blur. s=0 keeps
+            # the source, s=1 is full blur; nothing can ever ADD detail.
+            s = torch.sigmoid(self.unet(frames, cond_f, cue_f))
+            out = frames + s * (self._gaussian_blur(frames) - frames)
+        else:
+            delta = torch.tanh(self.res_scale * self.unet(frames, cond_f, cue_f))
+            # Bound the editor itself, not merely its final pixels. Positive edits
+            # consume a fraction of the distance to white; negative edits consume a
+            # fraction of the source value. This guarantees [0,1], preserves exact
+            # identity at initialization and, crucially, makes an all-black collapse
+            # impossible in one preprocessing pass even if the rate loss dominates.
+            positive = delta.clamp_min(0.0) * (1.0 - frames)
+            negative = delta.clamp_max(0.0) * frames
+            out = frames + self.max_relative_edit * (positive + negative)
         if self.gate and mask is not None:
             # D1: structural saliency gating. Scale the *edit*, not the pixels:
             # mask=1 -> exact identity regardless of what the loss wants.
