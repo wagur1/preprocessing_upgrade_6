@@ -67,8 +67,38 @@ def test_gate() -> None:
     out_ms = pre(x, cond, mask=mask_small)
     assert out_ms.shape == x.shape
 
-    print("gate self-check passed")
+
+def test_gate_area() -> None:
+    torch.manual_seed(1)
+    pre = VideoPreprocessor(base_ch=8, gate_area=0.25)
+    with torch.no_grad():
+        for p in pre.unet.tail.parameters():
+            p.normal_(0, 0.1)
+    x = torch.rand(2, 3, 4, 16, 16)
+    cond = torch.zeros(2, 1)
+    out_free = pre(x, cond)
+
+    # known saliency: right half high, left half low
+    mask = torch.zeros(2, 1, 4, 16, 16)
+    mask[..., 8:] = 1.0  # top-50% area by construction
+    out = pre(x, cond, mask=mask)
+    # gate_area=0.25 protects only the top quarter -> the highest-saliency half
+    # is protected, so the right half must be exact identity...
+    assert torch.allclose(out[..., 8:], x[..., 8:], atol=1e-6), \
+        "hard gate must make the protected (top-area) half exact identity"
+    # ...while the unprotected left half keeps the full edit
+    assert torch.allclose(out[..., :8], out_free[..., :8], atol=1e-6)
+
+    # area=0 -> soft behaviour (regression guard for D1)
+    pre_soft = VideoPreprocessor(base_ch=8, gate_area=0.0)
+    pre_soft.load_state_dict(pre.state_dict())
+    out_soft = pre_soft(x, cond, mask=mask)
+    expect = x + (1.0 - mask) * (out_free - x)
+    assert torch.allclose(out_soft, expect, atol=1e-5)
+
+    print("gate_area self-check passed")
 
 
 if __name__ == "__main__":
     test_gate()
+    test_gate_area()

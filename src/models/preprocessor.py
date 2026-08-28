@@ -135,14 +135,23 @@ class VideoPreprocessor(nn.Module):
 
     def __init__(self, in_ch: int = 3, base_ch: int = 32, res_scale: float = 1.0,
                  cond_dim: int = 1, max_relative_edit: float = 0.25,
-                 gate: bool = True):
+                 gate: bool = True, gate_area: float = 0.0):
         super().__init__()
         if not 0.0 < max_relative_edit <= 1.0:
             raise ValueError("max_relative_edit must be in (0, 1]")
+        if not 0.0 <= gate_area < 1.0:
+            raise ValueError("gate_area must be in [0, 1)")
         self.cond_dim = cond_dim
         self.res_scale = res_scale
         self.max_relative_edit = max_relative_edit
         self.gate = gate
+        # D2: hard binarisation of the saliency mask. The D1 soft gate (per-clip
+        # min-max-normalised saliency) leaves mask values ~0.3-0.5 on much of the
+        # task region, so a strong edit (mu=10) still gets 50-70% through and the
+        # QP30-gap only reached -0.251. gate_area > 0 protects the top-`gate_area`
+        # fraction of pixels PER CLIP by saliency (scale-free): those become an
+        # exact identity, everything else is fully editable.
+        self.gate_area = gate_area
         self.unet = _UNet(in_ch, base_ch, cond_dim)
 
     @staticmethod
@@ -196,6 +205,13 @@ class VideoPreprocessor(nn.Module):
         if self.gate and mask is not None:
             # D1: structural saliency gating. Scale the *edit*, not the pixels:
             # mask=1 -> exact identity regardless of what the loss wants.
+            # D2: optionally binarise first -- protect the top-`gate_area`
+            # fraction of pixels per clip (scale-free hard protection).
+            if self.gate_area and self.gate_area > 0.0:
+                b = mask.shape[0]
+                flat = mask.reshape(b, -1)
+                thresh = torch.quantile(flat, 1.0 - self.gate_area, dim=1).view(b, 1)
+                mask = (flat >= thresh).to(mask.dtype).reshape(mask.shape)
             mask_f, _ = self._fold(mask.to(frames.dtype))
             if mask_f.shape[-2:] != frames.shape[-2:]:
                 mask_f = F.interpolate(mask_f, size=frames.shape[-2:],
