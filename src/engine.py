@@ -525,10 +525,23 @@ def _train_tracking(cfg: dict) -> str:
 # evaluation (dispatch)
 # --------------------------------------------------------------------------
 def evaluate(cfg: dict, ckpt_path: str, out_dir: str | None = None) -> dict:
+    state = torch.load(ckpt_path, map_location="cpu")
+    model_state = state["model"] if "model" in state else state
+    # Architecture hyper-parameters must match training, or weights silently
+    # load into a differently-parameterised editor (e.g. a smooth-mode
+    # checkpoint evaluated as a free residual editor). The training config is
+    # persisted inside the checkpoint; let it override the YAML for every
+    # model.* key that affects the architecture.
+    ckpt_cfg = state.get("cfg") if isinstance(state, dict) else None
+    if isinstance(ckpt_cfg, dict) and isinstance(ckpt_cfg.get("model"), dict):
+        arch_keys = ("edit_kind", "gate_area", "gate", "base_ch", "res_scale",
+                     "cond_dim", "max_relative_edit")
+        for k in arch_keys:
+            if k in ckpt_cfg["model"]:
+                cfg.setdefault("model", {})[k] = ckpt_cfg["model"][k]
     device = _device(cfg)
     pre, codec, analyzer = _build_models(cfg, device, role="eval")
-    state = torch.load(ckpt_path, map_location=device)
-    pre.load_state_dict(state["model"] if "model" in state else state)
+    pre.load_state_dict(model_state)
     pre.eval()
 
     out_dir = Path(out_dir or (Path(cfg.get("out_dir", "outputs")) / "eval"))
