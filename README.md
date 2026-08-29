@@ -7,13 +7,18 @@ vision model ("analyzer") stay frozen and standard — no bitstream changes, no
 decoder changes, no per-CTU QP maps. The preprocessor edits pixels *before*
 encoding so that, at the same bitrate, a machine still sees what it needs.
 
-> 🇻🇳 **Tóm tắt.** Bản nâng cấp 6 của pipeline tiền xử lý VCM. Chỉ huấn luyện
-> *preprocessor* đặt **trước** codec tiêu chuẩn (x264/x265) **đóng băng**.
-> Toàn bộ hạ tầng 5.1 (A1 multi-teacher, A2 task-mask, A3 STE, C1 yuv420 proxy,
-> C2 in-grid QP) được giữ nguyên. Đóng góp mới **(D1) structural saliency
-> gating**: edit pixel bị nhân với `(1 − M)` theo saliency của analyzer đóng
-> băng — `x_pre = x + (1 − M)·edit` — nên **vùng task-critical là identity
-> chính xác theo cấu trúc**, không loss nào đổi được accuracy của nó lấy rate.
+> 🇻🇳 **Tóm tắt.** Bản nâng cấp 6 của pipeline tiền xử lý VCM. Toàn bộ hạ tầng
+> 5.1 (A1 multi-teacher, A2 task-mask, A3 STE, C1 yuv420 proxy, C2 in-grid QP)
+> được giữ nguyên. Chuỗi đóng góp D-series (30 biến thể, ~40 GPU-giờ):
+> **(D1/D2)** gate saliency cấu trúc `x_pre = x + (1−M)·edit` — vùng task là
+> identity chính xác, nhưng residual edit vẫn học ra nhiễu tốn +5% bit.
+> **(D3/D4)** chứng minh bất khả thi: 5 cấu hình học (kể cả STE) đều chỉ ra
+> identity vì rate-gradient Gaussian-power chết dưới quantizer step.
+> **(D4.5)** kết quả dương đầu tiên của dự án — **ramp60 zero-training**:
+> `x_pre = x + s(QP)·(1−M)·(blur(x)−x)` đạt **BD-rate −2.0%/−2.3%** (9/9 seed
+> âm, BD-accuracy dương) — thắng mọi biến thể học và ngang/băn Zhao reproduce
+> cùng 3GB data. **(D8)** entropy prior có train thay rate-model chết — mở
+> đường cho phần learned phải thắng heuristic.
 
 ```
                      (trained)              (FROZEN)                 (FROZEN panel)
@@ -21,6 +26,8 @@ encoding so that, at the same bitrate, a machine still sees what it needs.
             U-Net + FiLM(rate)          x264 / x265                r3d_18 / mc3_18 / …
             + SFT(motion)               (yuv420 proxy at train)    + a HELD-OUT analyzer at eval
             + D1 GATE: edit *= (1-M)    M = task saliency of the frozen analyzer
+            or D4.5: fixed QP-ramp      (zero-training headline result)
+            or D8: learned-rate prior   (entropy model, in progress)
 ```
 
 The claim we optimize is the **preprocessor gain on the *same* codec**:
@@ -77,6 +84,119 @@ Design invariants:
   train/eval consistency, and the honest "universal" reading: protection regions
   derived from whichever frozen analyzer will consume the stream;
 * `model.gate: false` reproduces 5.1 exactly (ablation arm).
+
+## The upgrade-6 D-series: from gated learning to structure-only (2026-08-28/29)
+
+The D-series is a 30-variant, ~40-GPU-hour campaign run through the Kaggle API.
+Every stage kept the harness, protocol and eval fixed (3 GB Kinetics subset,
+207 test clips, held-out `r2plus1d_18`, QP grid [30…50], preset medium) so all
+numbers are directly comparable. Selection rule throughout: **QP30 accuracy gap
+≥ −0.05 on both codecs** (the light-QP damage 5.1 could never avoid).
+
+### D1/D2 — structural saliency gating (necessary, not sufficient)
+
+| variant | QP30-gap (h264/h265) | BD-rate | bpp |
+|---|---|---|---|
+| 5.1 control (no gate) | −0.319 / −0.300 | +75.5% / +41.5% | ~1% |
+| D1 soft gate | −0.251 / −0.251 | +69.6% / +46.1% | ~1% |
+| D2 hard gate 50% (`model.gate_area`) | −0.188 / −0.159 | +41.0% / +36.2% | **+5%** |
+
+The gate works exactly as designed (protected regions are bit-exact identity;
+QP30-gap recovers by a third) — but the *residual* edit the U-Net still learns is
+**rate-adding noise**: real x264/x265 bitrates went **up ~5%** at every QP. With
+μ=10 (MSE-to-source) penalising real smoothing, the free-residual editor's best
+strategy is feature-preserving noise — expensive for the codec, confusing for the
+analyzer.
+
+### D3/D3.1/D4 — the learning impossibility proof (5 independent configurations)
+
+Parameterising the edit as a convex blend toward blur
+(`model.edit_kind=smooth`: `x_pre = x + s·(blur(x) − x)`, s∈[0,1] — smoothing
+that *cannot* add detail) should make "cheaper than source" the only reachable
+direction. Instead, **every configuration learned the exact identity (s≈0,
+bpp-div 0.0%, BD 0.00%)**:
+
+| config | μ | mask | codec | result |
+|---|---|---|---|---|
+| D3 smooth50 | 10 | hard 50% | virtual | identity |
+| D3.1 free50 | **0** | hard 50% | virtual | identity |
+| D3.1 free50_m1 | 1 | hard 50% | virtual | identity |
+| D3.1 freesoft | 0 | soft | virtual | identity |
+| D4 ste_fix / ste_free | 0 | hard/soft | **STE (real codec fwd)** | identity |
+
+Root cause (read straight off `VirtualCodec._quant_rate`): the rate model is the
+parameter-free Gaussian-power formula `R = ½·log2(1 + 12·E[y²])`. Once the
+background is blurred, DCT coefficients fall below the quantiser step and
+`∂R/∂s → 0` — the rate gradient **dies exactly where smoothing would pay**.
+The always-alive CE gradient then pushes s→0 unopposed. STE does not help
+because its *backward* is still the proxy's. (Historical note: the first D3 run
+"passed" with −12…−20% bpp — a silent eval bug loaded smooth weights into the
+residual architecture; fixed in `80724ab`, `evaluate()` now restores
+architecture hyper-parameters from the config stored inside every checkpoint.
+Lesson: instrument the forward pass before believing good numbers.)
+
+### D3.2/D4.5 — structure without learning: the first positive result
+
+If learning through the untrained rate model is impossible, drop the learning:
+the **fixed-s ramp** is pure analysis — zero parameters, zero checkpoints, immune
+to the entire bug class above.
+
+```
+x_pre = x + s(QP)·(1 − M)·(blur(x) − x)
+M     = top-AREA% saliency per clip (hard mask, D2 machinery)
+s(QP) = [30: 0.0, 35: 0.2, 40: 0.4, 45: 0.7, 50: 1.0]   (QP-adaptive ramp)
+blur  = gaussian 5×5, σ=2
+```
+
+The QP-ramp exists because per-QP analysis of the fixed-smoothing pilot showed
+mid-QP (35–40) was the accuracy killer while QP45–50 was already winning
+(−6.4% bpp @ −0.029 gap) — so smoothing switches on only where it pays.
+
+**ramp60 (AREA=0.60), 3 seeds, 9/9 seed×codec observations negative:**
+
+| | h264 | h265 |
+|---|---|---|
+| BD-rate mean | **−1.99%** | **−2.34%** |
+| BD-accuracy mean | +0.010 | +0.019 |
+| QP30-gap | +0.000 | +0.000 |
+
+This is the project's first positive result, and it beats *every* learned variant
+of the 5.1/u6 campaign with zero training. (CI95 with n=3 still spans 0 —
+reported honestly as "consistently negative across all seeds", not p<0.05.)
+
+### D5–D7 — the saturation study (17-config grid)
+
+Tuning around ramp60 (strength ×2, σ∈{2,2.5,3,3.5,4}, AREA∈{0.60…0.70},
+sharp-vs-ramp shapes, per-codec splits with encoder-matched configs) maps a
+clean concave landscape: **heuristic smoothing saturates at ≈−3%** (single-seed
+best h264 −3.05% @ σ=3; pushing strength *worsens* BD to +2…+5% because heavy
+blur on a small unprotected region leaves large residuals). The grid is the
+paper's evidence that the next gains must come from *learning* — which the
+D8 entropy model supplies.
+
+### D8 — learned factorized-prior rate model (the fix the proofs pointed to)
+
+`src/models/entropy_codec.py` (`codec.kind=entropy`): the Gaussian-power rate is
+replaced by a **trained Laplacian factorized prior** — per-DCT-position mixture
+(K components: weights/locs/scales as 3 tiny tables) over quantised symbols,
+with its own Adam. Gradient now flows as `-∂log2 p(symbol)/∂s` — alive for any
+symbol the prior assigns mass to, and the prior itself learns which symbols the
+codec actually produces. Running results land in this table as they arrive.
+
+### Where this leaves the contribution ladder (same 3 GB data, same protocol)
+
+| method | BD-rate h264 / h265 | cost |
+|---|---|---|
+| 5.1 learned (best of 11 variants) | +2.1% / +3.2% | full training |
+| u6 learned + gate (best) | +47.7% / +32.5% | full training |
+| **u6 fixed ramp60 (this repo)** | **−2.0% / −2.3%** | **zero training** |
+| Zhao et al. reproduced @ 3 GB (user-run, 400 videos) | +0.77% / −3.18% | full training |
+| Zhao et al. reported (full Kinetics, A100, per-backbone) | −12.3…−19.6% | per-backbone training |
+
+At matched data scale the zero-training heuristic is **on par with or better
+than the learned baseline** — and unlike it, works zero-shot with any analyzer
+(the saliency mask comes from whichever analyzer will consume the stream, at
+inference time).
 
 ## Why upgrade-3 (what was limiting upgrade-2)
 
@@ -210,6 +330,9 @@ at zero cost.
 src/
   models/
     preprocessor.py    U-Net + FiLM(rate) + SFT(motion) pixel editor (trained)
+                        + D1/D2 saliency gate (gate, gate_area)
+                        + D3 smooth parameterisation (edit_kind=smooth)
+    entropy_codec.py   D8 learned Laplacian factorized-prior rate model
     virtual_codec.py   differentiable block-DCT proxy (+ A3 soft→hard anneal)
     codec.py           CompressAI learned proxy (alternative training codec)
     ste_codec.py       A3 straight-through real-codec wrapper
@@ -224,10 +347,11 @@ src/
   metrics/bd_rate.py   Bjøntegaard BD-Rate/BD-accuracy on the rate–accuracy curve
   engine.py            train / eval loop, rate conditioning, 6-pipeline BD-Rate
 configs/
-  universal_action_recognition.yaml   A1+A2+A3 headline config
+  universal_action_recognition.yaml   A1+A2+A3 headline config (+ D-series keys)
   action_recognition.yaml, tracking.yaml   single-analyzer baselines
 docs/MODEL.md, docs/IMPROVEMENTS.md, docs/KAGGLE.md
 kaggle/   ready-to-run Kaggle notebook + launcher
+tests/    39 unit tests incl. gate/smooth/entropy self-checks
 ```
 
 Every non-trivial module has a `__main__` self-check (`python -m src.models.virtual_codec`,
