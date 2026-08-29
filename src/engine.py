@@ -92,7 +92,26 @@ def _build_models(cfg: dict, device: torch.device, role: str = "train"):
     ).to(device)
     cc = cfg["codec"]
     kind = cc.get("kind", "compressai")
-    if kind in ("virtual", "ste"):
+    if kind == "entropy":
+        # D8: block-DCT proxy whose rate is a TRAINED Laplacian factorized
+        # prior (per DCT position) instead of the parameter-free Gaussian-
+        # power formula — the 5 learning-failure proofs showed the latter's
+        # gradient dies below the quantiser step, so no configuration could
+        # learn smoothing strength. The prior learns the codec's true symbol
+        # distribution online (see src/models/entropy_codec.py).
+        from .models.entropy_codec import LearnedRateCodec
+        proxy = LearnedRateCodec(
+            qualities=tuple(cc.get("qualities", [1, 2, 3, 5, 8])),
+            block=cc.get("block", 8),
+            q_steps=cc.get("q_steps"),
+            step_coarse=cc.get("step_coarse", 0.25),
+            step_fine=cc.get("step_fine", 0.03),
+            inter=cc.get("inter", True),
+            colorspace=cc.get("colorspace", "yuv420"),
+            chroma_step_scale=cc.get("chroma_step_scale", 2.0),
+            n_components=cc.get("entropy_components", 3),
+        ).to(device)
+    elif kind in ("virtual", "ste"):
         # block-transform proxy matched to x264/x265 geometry (Zhao et al.);
         # 5.1 C1: default yuv420 colourspace matches -pix_fmt yuv420p.
         proxy = VirtualCodec(
@@ -302,6 +321,12 @@ def _fit(cfg, pre, codec, analyzer, train_loader, val_loader, prep_batch,
         use_task_mask=bool(lw.get("use_task_mask", False)),
     )
     opt = _optimizer(pre, tr)
+    # D8: the learned-rate prior carries its own Adam so its tiny tables can
+    # move at a different pace than the U-Net (and survive cosine decay of
+    # the preprocessor's LR).
+    rate_opt = None
+    if hasattr(codec, "rate_params"):
+        rate_opt = torch.optim.Adam(codec.rate_params.parameters(), lr=1e-3)
     epochs = int(tr.get("epochs", 5))
     max_steps = tr.get("max_steps", None)
     qp_list, qp_to_quality = _training_codec_setup(tr, codec)
@@ -407,8 +432,12 @@ def _fit(cfg, pre, codec, analyzer, train_loader, val_loader, prep_batch,
                 if pinned:
                     analyzer.unpin_active()
             opt.zero_grad(set_to_none=True)
+            if rate_opt is not None:
+                rate_opt.zero_grad(set_to_none=True)
             parts["loss"].backward()
             opt.step()
+            if rate_opt is not None:
+                rate_opt.step()
             if sched is not None:
                 sched.step()
             step += 1
