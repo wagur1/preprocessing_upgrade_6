@@ -323,8 +323,13 @@ def _fit(cfg, pre, codec, analyzer, train_loader, val_loader, prep_batch,
     opt = _optimizer(pre, tr)
     # D8: the learned-rate prior carries its own Adam so its tiny tables can
     # move at a different pace than the U-Net (and survive cosine decay of
-    # the preprocessor's LR).
+    # the preprocessor's LR). Phase discipline (Ballé-style): the prior
+    # calibrates on RAW content first (preprocessor held at identity), then
+    # FREEZES — otherwise it co-adapts to the edited content, learns that
+    # "everything is cheap", and the rate gradient stops distinguishing
+    # blurred from sharp (the ent50 failure mode).
     rate_opt = None
+    rate_freeze_after = int(tr.get("rate_freeze_after", 0))
     if hasattr(codec, "rate_params"):
         rate_opt = torch.optim.Adam(codec.rate_params.parameters(), lr=1e-3)
     epochs = int(tr.get("epochs", 5))
@@ -438,6 +443,15 @@ def _fit(cfg, pre, codec, analyzer, train_loader, val_loader, prep_batch,
             opt.step()
             if rate_opt is not None:
                 rate_opt.step()
+                # Phase discipline: after N steps of joint calibration, freeze
+                # the prior so the rate gradient stays anchored to the raw-
+                # content statistics the preprocessor must now beat.
+                if rate_freeze_after and step >= rate_freeze_after:
+                    for p in codec.rate_params.values():
+                        p.requires_grad_(False)
+                    rate_opt = None
+                    print(f"[train] rate prior FROZEN at step {step} "
+                          f"(rate_freeze_after={rate_freeze_after})", flush=True)
             if sched is not None:
                 sched.step()
             step += 1
