@@ -36,6 +36,13 @@ preprocessor lets the machine reach the same accuracy at fewer bits. (Cross-code
 comparisons are reported too, but QP is not comparable across codecs, so they are
 reference-only.)
 
+> **Status (2026-08-30).** The D-series sections below are kept as written, on their original
+> 207-clip protocol. They have since been re-measured on **1159 clips with clip-level
+> confidence intervals**, and the conclusion changed: the analytic family's effect is ≈0 ± 3%
+> and no variant yet meets the target. Start at
+> [The full-dataset chapter](#the-full-dataset-chapter-1159-clips-2026-08-30--what-survived)
+> for the current state; read the D-series for how it was arrived at.
+
 ---
 
 ## Why upgrade-6 (what ended upgrade-5.1)
@@ -197,6 +204,150 @@ At matched data scale the zero-training heuristic is **on par with or better
 than the learned baseline** — and unlike it, works zero-shot with any analyzer
 (the saliency mask comes from whichever analyzer will consume the stream, at
 inference time).
+
+> **Superseded.** This ladder is on 207 test clips. On 1159 clips the ramp row measures
+> −3.41% / −0.26% with a clip-level CI, and the family's true effect is ≈0 ± 3%. See
+> [The full-dataset chapter](#the-full-dataset-chapter-1159-clips-2026-08-30--what-survived).
+
+## The full-dataset chapter (1159 clips, 2026-08-30) — what survived
+
+Every number above this line was measured on a **3 GB index → 207 test clips**, which is
+why single-seed BD-rate swung ±2%. The attached Kaggle dataset is **35.8 GB**; indexing all
+of it gives **1159 test clips** (test-set fingerprint `30f083f8520a`, asserted identical by
+every shard). Evaluation is sharded across 6 Kaggle GPU slots (3 accounts × 2 batch
+sessions) and merged additively.
+
+Two protocol details that turned out to matter:
+
+1. **Shard membership and the train/test split are MD5-of-clip-path, not list position.**
+   `build_index` shuffles a list whose order comes from `os.walk`, which is not stable
+   across machines — a positional split would have silently overlapped between shards.
+2. **Each shard dumps per-clip rows** (bpp, top-1 hit, GT probability) as well as the
+   additive accumulators, so the merge bootstraps a **clip-level 95% CI on BD-rate**. That
+   interval, not a 3-seed spread, is the honest error bar for "this method on this test set".
+
+> ### ⚠️ Correction to everything above
+> At 1159 clips the whole analytic saliency-blur family — **ramp60 / D4.5 included** — sits
+> inside a confidence interval that spans or nearly spans zero. Its true effect is
+> **≈0 ± 3%**, and the D1–D9 *ranking* of variants was fitting noise. The −2.0%/−2.3%
+> headline is not retracted as a measurement; it is retracted as a *result*. Read the table
+> below, not the tables above.
+
+### Every variant measured on the full set
+
+Selection rule ("gap rule"): the per-QP accuracy gap `prep − anchor` must be **≥ −0.05 at
+every QP** on both codecs. A variant that fails it is disqualified regardless of BD-rate.
+
+| variant | mechanism | h264 BD [95% CI] | h265 BD | gap rule |
+|---|---|---|---|---|
+| `t_base` | ramp blur + static saliency mask (the D4.5 headline) | **−3.41%** [−5.67, −1.24] | −0.26% | PASS (−0.015) |
+| `x_base` | same, mask from a **held-out** analyzer | −2.65% [−4.64, −0.49] | **−1.43%** | PASS (−0.011) |
+| `f_s4` | flat strength s=0.4, no ramp | −1.14% [−3.44, +0.98] | −0.21% | PASS (−0.029) |
+| `t_stat` | ramp + static mask, temporal proxy (918 clips) | −1.90% [−4.39, +0.58] | +1.32% | FAIL (−0.062) |
+| `f_s7` | flat s=0.7 | +2.50% | +3.46% | — |
+| `lo_s7` | flat s=0.7 on a QP20–40 grid | +9.28% [+2.70, +15.06] | +5.62% | FAIL (−0.066) |
+| `r96` | spatial resample round-trip to 96² | +8.54% [+5.57, +11.60] | +8.69% | FAIL (−0.144) |
+| `tdup6` | temporal hold, every 6th frame | **−8.18%** [−11.30, −5.22] | −0.23% | **FAIL (−0.176)** |
+| `g224` | per-codec encoder flags at `frame_size` 224 | −0.65% [−3.81, +2.32] | −0.84% | FAIL (−0.072) |
+
+`tdup6` is the largest BD-rate the project has produced and the only one to clear the −8%
+publication target — and it is **disqualified**: a −0.176 gap is 3.5× the rule. Note where
+both `tdup6` and `g224` broke: **QP45**. The gap, not the bitrate, is the binding
+constraint, and it has been the binding constraint in every failure here.
+
+### The mechanism: R-D neutrality
+
+The variants above do not fail for unrelated reasons. They fail for one reason, and it is
+measurable per QP: **at the accuracy the preprocessed clip actually reaches, the bare anchor
+would have needed about the same number of bits.** Ask the anchor's own
+(accuracy → log bpp) curve what a given accuracy costs it, and every prefilter's saving
+turns out to be worth roughly what it destroyed. A blur that saves 11% of the bitrate and
+loses 0.03 of accuracy is, on the anchor's curve, indistinguishable from simply raising QP.
+
+This has now been confirmed on **five independent mechanisms**: spatial blur, saliency
+gating, temporal frame-drop, spatial rate allocation (a per-block QP field), and — for the
+first time on something that is not a prefilter at all — **encoder-side configuration**
+(`g224`: `-tune ssim`, `psy-rd=0:psy-rdoq=0`). Turning off psychovisual RDO saved *more*
+bits than predicted and still returned BD ≈ 0.
+
+Two consequences worth stating plainly, because they cost GPU-hours to learn:
+
+- **A bitrate-only probe is not evidence of a lead.** `lo_s7` saved a constant −9…−12% at
+  every QP and returned **+9.28%**, because the anchor's curve at QP20 is so steep that a
+  −0.029 accuracy gap prices at +73% bitrate-equivalent. The break-even accuracy budget is
+  brutally small at low QP and grows with QP.
+- **A local 3-clip screen must be calibrated, and the calibration is not universal.** `r96`
+  showed the screen optimistic by 0.60×; `g224` showed it **pessimistic by 1.63×**. The
+  difference is the anchor's saturation, not the sample — at `frame_size` 112 the anchor
+  sits on a fixed-overhead floor that dilutes any saving.
+
+### The geometry result: why every h265 number was ≈0
+
+h265's BD-rate came out near zero in almost every round, and it was not the codec being
+stubborn. At 112², h265 spans only **×3.38 of bitrate across the entire QP30–50 grid**
+(h264 spans ×6.19), with per-QP steps decaying −36.9/−30.0/−22.7/−13.5% — monotonically
+decaying step sizes are the fingerprint of a fixed-overhead floor. The QP45→50 segment is
+near-vertical in the rate–accuracy plane, so a BD integral over it is badly conditioned and
+any percentage saving is measured against a curve that barely moves.
+
+At 224² the same measurement reads **×5.02 for h265** (h264 ×6.92) with near-constant steps,
+and h265's QP50 accuracy rises from 0.115 to 0.250. **The geometry, not the QP grid, was the
+problem** — which also retires the per-codec QP grid that was proposed as a fix.
+
+### Axis ledger
+
+| axis | status | evidence |
+|---|---|---|
+| spatial blur / saliency gating | **closed** | R-D neutral; family monotone in strength, optimum is the identity approached from below |
+| temporal frame-drop | **closed** | `tdup6` −8.18% BD but gap −0.176 |
+| spatial rate allocation (per-block QP field) | **closed** | at *matched* bitrate nothing beats letting the encoder allocate |
+| chroma | **closed** | discarding chroma **entirely** saves only 3–6% of the bitstream |
+| per-codec encoder configuration | **closed** | `g224` BD ≈ 0, h264 gap FAIL |
+| **224 geometry + top-octave resample** | **live** | the analyzer resizes any input to 112 internally, so the top octave at 224 is analyzer-invisible while the codec still pays for it |
+
+One negative result inside the rate-allocation row is worth keeping: the **saliency map does
+carry real information**. Protecting the wrong half of the blocks (same block count, mirrored
+mask) costs 0.32 / 0.24 of accuracy against protecting the right half. So "the mask does no
+work" is a property of *blurring*, not of the map.
+
+### Where the project actually stands
+
+**No variant meets the publication target** (BD-rate ≤ −8% on *both* codecs with the gap rule
+passed). Measured so far: everything that passes the gap lands in −1…−3.4% with h265 ≈ 0, and
+the one variant that beat −8% failed the gap by 3.5×.
+
+The live axis is the only one left, and it is the first with bits to spare. Because
+`ActionRecognitionAnalyzer._prep` resizes any input to `clip_size` 112 unconditionally — in
+*both* arms — running the pipeline at `frame_size` 224 means the top spatial octave is
+**invisible to the analyzer but still paid for by the encoder**. Removing it is therefore
+close to free on the accuracy axis by construction, not by luck. A local screen prices a
+resample round-trip to 160² at −28/−20/−13% of the bitrate for a prediction movement of
+−0.022, and a fine sweep puts the damage knee at 128 (everything ≥128 on one plateau).
+
+Priced on the *measured* 224 anchor, the expected BD-rate as a function of the accuracy gap:
+
+| assumed gap | h264 | h265 |
+|---|---|---|
+| 0.00 | −12.8 … −21.4% | −9.6 … −16.2% |
+| −0.02 | −7.0 … −16.3% | −5.1 … −12.2% |
+| −0.03 | −4.2 … −13.8% | −3.0 … −10.3% |
+| −0.05 | **+1.2** … −9.1% | **+0.9** … −6.8% |
+
+(range = local-screen calibration bracketed over 0.6–1.0, for the reason given above)
+
+Which sharpens the success criterion: **a gap of exactly −0.05 is legal under the
+publication rule and still misses the target.** This axis needs the gap to come in at
+**≥ −0.03**, and a PASS at −0.04…−0.05 must be read as a near-miss rather than a win.
+
+> 🇻🇳 **Tóm tắt chương full-dataset.** Toàn bộ số D-series ở trên đo trên 207 clip; ở
+> **1159 clip** cả họ blur/saliency (kể cả ramp60) nằm trong khoảng tin cậy chứa 0 — hiệu
+> ứng thật ≈0 ± 3%, và thứ tự xếp hạng giữa các biến thể là fit nhiễu. Cơ chế đã tìm ra:
+> **trung hoà R-D** — tại độ chính xác mà clip tiền xử lý đạt được, anchor trần cũng chỉ
+> cần xấp xỉ số bit đó, nên mọi khoản tiết kiệm đều đúng bằng thứ đã phá. Đã xác nhận trên
+> 5 cơ chế độc lập, gồm cả cấu hình encoder. **Ràng buộc quyết định là accuracy gap, không
+> phải bitrate** — `tdup6` đạt BD −8.18% (con số lớn nhất dự án từng có) nhưng bị loại vì
+> gap −0.176. Trục duy nhất còn sống là hình học 224: analyzer luôn resize về 112 nên octave
+> không gian trên cùng ở 224 là *vô hình với analyzer nhưng encoder vẫn trả tiền*.
 
 ## Why upgrade-3 (what was limiting upgrade-2)
 
