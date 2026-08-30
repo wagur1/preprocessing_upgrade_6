@@ -118,23 +118,55 @@ Checkpoint delivery to eval kernels: push `best` checkpoint as a small Kaggle da
 ## 5. Pre-registered selection rule (Phase 2 → 3)
 
 The model is unconditioned, so the bit operating point is a single global strength
-`x_pre(s) = x + s·Δ(x)`. On the 120-clip screen:
+`x_pre(s) = x + s·Δ(x)`. Screen grid (extended per 2026-08-31 review — it must bracket
+Δbpp=0 on BOTH sides): **s ∈ {0.1, 0.25, 0.5, 0.75, 1.0, 1.5}**. s=0.1 is mandatory: if
+Δbpp > 0 even at 0.25, a grid starting there can only report "no valid operating point".
+s=1.5 is cheap insurance for the opposite branch. On the 120-clip screen (per resolution,
+128 AND 224):
 
-1. Compute screen BD(s) per codec (screens RANK, never claim) and the per-QP gap(s).
-2. **s\* = argmin_s BD_screen(s) subject to gap_screen(s) ≥ −0.03 at every QP, both codecs.**
-   If no s passes, take s with the best gap-passing tradeoff and flag the round as
-   expected-negative before spending Phase 3.
-3. Run Phase 3 ONCE at s\*. (A second point s\*±0.25 is allowed only if quota ≥ 30h remains.)
+1. **Selection is by THRESHOLD, not argmin BD** (pick_s.py, pre-registered):
+   `s* = max{ s : gap(s) ≥ −0.03 at every QP, both codecs AND Δbpp(s) ≤ 0 at every QP,
+   both codecs }`, with paired bootstrap 5% lower bounds per point ("gap not decidable at
+   this n" is printed rather than silently trusted). Rationale: at n≈120 BD spreads 14–16 pp
+   (the n=207 lesson: t_stat reads +1.93% and −1.90% at different sample sizes — SIGN FLIP);
+   but a one-parameter MONOTONE family is threshold-searchable at n=120, and Δbpp at fixed
+   QP contains no analyzer at all. BD is deliberately NOT computed by the selector.
+2. If the selector prints "no operating point satisfies the rule": **do NOT conclude the
+   mechanism failed** — extend the grid DOWN (s < 0.1) first; the mu-cap analysis says the
+   likely failure mode is an over-expensive edit, which lives at small s.
+3. Run Phase 3 ONCE per resolution at that resolution's s\*. (A second point s\*±0.25 is
+   allowed only if quota ≥ 30h remains.)
+
+Note on the objective (2026-08-31 review correction): mu=10 is a LOOSE CAP, not a pin —
+with residual RMS ~0.013, 10·MSE ≈ 1.7e-3 against CE ≈ 1.0, and the |dL_task/de| > 20e
+boundary sits at e ≈ 0.19, far beyond any edit we want. Consequence: the realistic risk is
+NOT a timid (near-identity) edit but an over-bit-expensive one — which is exactly what the
+two-sided screen grid and the Δbpp ≤ 0 selector rule are built to catch.
 
 ## 6. Outcome interpretations (decided in advance)
+
+**Pre-registered expectations (pinned BEFORE any number, per 2026-08-31 review):**
+
+- **Transfer haircut:** the teacher panel [r3d_18, mc3_18] deliberately does NOT contain the
+  eval analyzer r2plus1d_18 (the universality claim). Lu et al. measure a 25–30% haircut
+  for cross-backbone transfer (−22.0% on-teacher → −16.4/−15.7% transferred). Therefore, to
+  measure −11% (the certification threshold) on the held-out analyzer, the on-teacher number
+  must be ≈ −15%, i.e. **Δacc ≈ +0.065, not +0.05**. Evaluate the screen against this bar.
+- **The untested variable is CAPACITY, not steps:** D10 multiplies data 6× (1,442 → ~8.6k
+  clips) and steps ~7× (901 → ~6,483), but the model stays at 9,795 parameters vs Lu et al.'s
+  9.42M (962×). At this size, 6.5k steps most likely converge — so a flat D10 result does
+  NOT close the additive branch; it opens the capacity question (arm B / width becomes the
+  next experiment, not a retraction of the mechanism).
+
+Verdicts:
 
 - **Measured BD ≤ −11% both codecs, gap pass** → the method paper is alive; replicate seed; add
   tracking task; move to publication checklist.
 - **−4…−8% territory** → scale ceiling is real at 10.8K clips; report honestly; the neutrality
   paper gains the additive-scale datapoint; decide then whether a 2nd seed / arm B is justified.
-- **≈ 0 ± 3% or worse** → R-D neutrality holds even for the additive family at this scale;
-  the neutrality/boundary-condition paper gets its capstone ("even the SOTA-sign mechanism is
-  neutral at 10.8K-clip scale") — write it.
+- **≈ 0 ± 3% or worse** → R-D neutrality holds even for the additive family at this scale —
+  **read as a capacity datapoint, not a mechanism refutation** (see above); the
+  neutrality/boundary-condition paper gets its capstone — write it.
 - **Δbpp(s=1) far worse than the additive run's (+14.8%→+4%)** → the virtual-codec distortion
   channel pushed the edit the wrong way; diagnostic before any retrain: compare edit statistics
   (PSNR, TV) against best.pt's (37.7 dB).
