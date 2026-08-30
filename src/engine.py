@@ -54,7 +54,7 @@ from .data import (
 )
 from .losses import LossWeights, preprocessing_loss
 from .metrics import aggregate_metrics, bd_metric, bd_rate, sequence_metrics
-from .models import CompressAICodec, STECodec, VideoPreprocessor, VirtualCodec
+from .models import AdditivePreprocessor, CompressAICodec, STECodec, VideoPreprocessor, VirtualCodec
 from .models.task_mask import task_saliency
 from .tasks import build_task
 from .tasks.base import build_analyzer
@@ -81,15 +81,29 @@ def _seed_everything(seed: int) -> None:
 
 def _build_models(cfg: dict, device: torch.device, role: str = "train"):
     m = cfg["model"]
-    pre = VideoPreprocessor(
-        base_ch=m.get("base_ch", 32),
-        res_scale=m.get("res_scale", 1.0),
-        cond_dim=m.get("cond_dim", 1),
-        max_relative_edit=m.get("max_relative_edit", 0.25),
-        gate=bool(m.get("gate", True)),
-        gate_area=float(m.get("gate_area", 0.0)),
-        edit_kind=str(m.get("edit_kind", "residual")),
-    ).to(device)
+    arch = str(m.get("arch", "unet"))
+    if arch == "additive":
+        # Zhao-style two-branch additive residual (9,795 params), pinned by the
+        # additive run's best.pt. Unconditioned and ungated by design; the
+        # shared loops still pass cond/mask and this model ignores them.
+        # ``strength`` is the eval-time operating point, deliberately NOT an
+        # arch key: evaluate() must not restore it from the training config.
+        pre = AdditivePreprocessor(
+            temporal_frames=int(m.get("temporal_frames", 8)),
+            strength=float(m.get("strength", 1.0)),
+        ).to(device)
+    elif arch == "unet":
+        pre = VideoPreprocessor(
+            base_ch=m.get("base_ch", 32),
+            res_scale=m.get("res_scale", 1.0),
+            cond_dim=m.get("cond_dim", 1),
+            max_relative_edit=m.get("max_relative_edit", 0.25),
+            gate=bool(m.get("gate", True)),
+            gate_area=float(m.get("gate_area", 0.0)),
+            edit_kind=str(m.get("edit_kind", "residual")),
+        ).to(device)
+    else:
+        raise ValueError(f"model.arch must be 'unet' or 'additive', got {arch!r}")
     cc = cfg["codec"]
     kind = cc.get("kind", "compressai")
     if kind == "entropy":
@@ -334,6 +348,9 @@ def _fit(cfg, pre, codec, analyzer, train_loader, val_loader, prep_batch,
         rate_opt = torch.optim.Adam(codec.rate_params.parameters(), lr=1e-3)
     epochs = int(tr.get("epochs", 5))
     max_steps = tr.get("max_steps", None)
+    # Gradient clipping (the additive run trained with clip_grad=1.0; the
+    # Zhao loss has no bounded-edit envelope, so this is the safety net).
+    clip_grad = float(tr.get("clip_grad", 0.0))
     qp_list, qp_to_quality = _training_codec_setup(tr, codec)
 
     total_steps = len(train_loader) * epochs
@@ -440,6 +457,8 @@ def _fit(cfg, pre, codec, analyzer, train_loader, val_loader, prep_batch,
             if rate_opt is not None:
                 rate_opt.zero_grad(set_to_none=True)
             parts["loss"].backward()
+            if clip_grad > 0:
+                torch.nn.utils.clip_grad_norm_(pre.parameters(), clip_grad)
             opt.step()
             if rate_opt is not None:
                 rate_opt.step()
@@ -577,8 +596,8 @@ def evaluate(cfg: dict, ckpt_path: str, out_dir: str | None = None) -> dict:
     # model.* key that affects the architecture.
     ckpt_cfg = state.get("cfg") if isinstance(state, dict) else None
     if isinstance(ckpt_cfg, dict) and isinstance(ckpt_cfg.get("model"), dict):
-        arch_keys = ("edit_kind", "gate_area", "gate", "base_ch", "res_scale",
-                     "cond_dim", "max_relative_edit")
+        arch_keys = ("arch", "temporal_frames", "edit_kind", "gate_area", "gate",
+                     "base_ch", "res_scale", "cond_dim", "max_relative_edit")
         for k in arch_keys:
             if k in ckpt_cfg["model"]:
                 cfg.setdefault("model", {})[k] = ckpt_cfg["model"][k]
