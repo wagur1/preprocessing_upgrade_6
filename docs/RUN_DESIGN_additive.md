@@ -137,6 +137,8 @@ resolution. On the 120-clip screen (per resolution, 128 AND 224):
 2. If the selector prints "no operating point satisfies the rule": **do NOT conclude the
    mechanism failed** — extend the grid DOWN (s < 0.02) first; the measurement below says the
    failure mode is an over-expensive edit, which lives at small s.
+   **VOIDED 2026-08-31 by the screen itself, see §5.1 — this clause presupposed gap ≥ 0, and
+   the measured gap is monotonically NEGATIVE. Do not extend the grid down.**
 3. Run Phase 3 ONCE per resolution at that resolution's s\*. (A second point s\*±0.25 is
    allowed only if quota ≥ 30h remains.)
 
@@ -160,6 +162,39 @@ smooth synthetic input rises 22% even at s=0.1 (read as direction only — the s
 baseline TV is artificially low, so real video will scale less), i.e. the edit ADDS structure
 to encode. Expect Δbpp > 0 across most of the grid; the whole selector exists to find where,
 or whether, it crosses zero.
+
+### 5.1 Screen outcome, r128 (measured 2026-08-31, `pick_s.py` on `outputs/d10_screen_r128`)
+
+113 clips × 5 QP × 2 codecs × 7 arms (7 of 120 clips failed to decode; arms are paired, so the
+loss is unbiased). **VERDICT: no operating point satisfies the rule.** Both conditions fail at
+every s:
+
+| s | gap h264 | gap h265 | Δbpp h264 | Δbpp h265 |
+|---|---|---|---|---|
+| 0.02 | −0.004 | −0.019 | +2.0% | +1.1% |
+| 0.05 | −0.007 | −0.023 | +4.7% | +2.9% |
+| 0.10 | −0.038 | −0.045 | +9.9% | +5.9% |
+| 0.25 | −0.124 | −0.117 | +24.3% | +14.0% |
+| 0.50 | −0.196 | −0.218 | +42.7% | +23.9% |
+| 1.00 | −0.306 | −0.315 | +67.3% | +35.6% |
+
+(means over QP; worst single point −0.522 at h264 QP30 s=1.0. Damage is largest at QP30 and
+decays to ≈0 by QP50 — it is worst exactly where the anchor is strongest.)
+
+**This is a DIRECTION result, not a magnitude one, and that is what voids §5.2.** At s=0.02 the
+edit magnitude *matches* best.pt (RMS 0.011 vs 0.013; 39.2 dB vs 37.7 dB) and the gap is
+indistinguishable from zero (boot5% −0.053…+0.000) where best.pt delivered **+0.033**. Same size,
+no gain. Both selection quantities are monotone in s and reach zero only at s=0 — the identity —
+so extending the grid downward converges to the anchor from the wrong side and its best possible
+outcome is BD = 0. A screen below s=0.02 is therefore not run; it would spend a session to
+confirm a guaranteed null. Phase 3 is held for the same reason: BD on a checkpoint that is
+accuracy-negative at every affordable s prices nothing.
+
+Cause attribution is deferred to the no-codec diagnostic (`u6-d10-diag-r128`: all three
+backbones, clean input, same 120-clip screen set), which separates "our reading of the objective
+trains damage" (teachers also negative) from "cross-backbone transfer failure" (teachers
+positive, held-out r2plus1d_18 negative). Nothing in the screen can separate them: it discards
+`src_ok` and every number in it is post-codec and held-out-analyzer only.
 
 ## 6. Outcome interpretations (decided in advance)
 
