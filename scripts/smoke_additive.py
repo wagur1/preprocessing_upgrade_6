@@ -105,15 +105,24 @@ def main() -> None:
             clips, labels = batch
             return clips.to(device), labels.to(device)
 
-        # first-batch probes: residual live, loss finite, all parts present
+        # first-batch probes. to_rgb is zero-init (src/models/additive.py), so an
+        # UNTRAINED additive model is exactly identity -- that is the invariant
+        # here; the Phase-0 "Delta != 0" gate can only be checked after _fit.
         clips, labels = prep(next(iter(loader)))
-        x_pre = pre(clips)
+        with torch.no_grad():
+            x_pre = pre(clips)
         assert x_pre.shape == clips.shape and x_pre.min() >= 0 and x_pre.max() <= 1
-        assert not torch.allclose(x_pre, clips, atol=1e-6), "residual must be live"
-        assert float((x_pre - clips).abs().mean()) < 0.25, "init edit suspiciously large"
+        assert torch.equal(x_pre, clips), "untrained model must be exact identity"
 
         ckpt = _fit(cfg, pre, codec, analyzer, loader, val, prep,
                     "smoke-additive", n_train=len(ds))
+
+        # Phase-0 gate proper: after training the residual must be LIVE and sane.
+        with torch.no_grad():
+            d = (pre(clips) - clips).abs().mean().item()
+        print(f"[smoke] trained edit |dx| = {d:.5f}")
+        assert d > 1e-6, "residual must be live after _fit"
+        assert d < 0.25, "trained edit suspiciously large"
         state = torch.load(ckpt, map_location="cpu", weights_only=False)
         assert torch.isfinite(torch.cat([v.flatten() for v in state["model"].values()
                                          if v.is_floating_point()])).all(), "NaN in weights"

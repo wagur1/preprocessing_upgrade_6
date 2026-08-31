@@ -92,13 +92,14 @@ panel is our contribution and a regulariser. Single-teacher is the fallback opti
 
 16 frames, stride 2, **frame_size 128** (train + canonical eval both — self-consistent round,
 same geometry as the additive run; the analytic-family table at 112 is not directly comparable
-and doesn't need to be), analyzer clip_size 112, batch 4 × accum 2 (effective 8, as the run),
+and doesn't need to be), analyzer clip_size 112, batch 8 (no gradient accumulation in this harness -- the config ships train.batch_size: 8 and run-1 trained fine with it),
 lr 1e-4 Adam, cosine, seed 0, val every epoch (`val_qp_mode: all`, `val_max_batches: 5`),
 early stop patience 3, `resume: true` wired for session-death recovery (12h Kaggle cap).
 
-Schedule: 2,161 loader-steps/epoch (~1,081 opt steps). fp32 ≈ 2.5 s/step (D9-kernel evidence)
-→ ~90 min/epoch → **6 epochs ≈ 9h**; with AMP (optional, smoke-gated) ~10 epochs. That is
-6–10× the additive run's ~900 steps. Budget the session at 10h with 2h margin.
+Schedule: 2,161 loader-steps/epoch (~1,081 opt steps). **MEASURED on T4 (run of
+2026-08-31, `dl_train_fix/u6-d10-train.log`): ~23 min/epoch, 6 epochs in 2h24m** —
+the earlier "fp32 ≈ 2.5 s/step → ~90 min/epoch → 6 epochs ≈ 9h" estimate was ~4×
+too pessimistic and produced two wrong ETAs. Budget 3h with 1h margin, not 10h.
 
 ## 4. Phases, gates, and cost
 

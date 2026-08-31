@@ -6,10 +6,10 @@ Design (informed by the whole u6 campaign):
   blur) with the D2 hard saliency gate — structure is proven; only the RATE
   MODEL and the STRENGTH head learn.
 - Rate model: per-frequency Laplacian factorized prior (Ballé-style, small:
-  one (K,) logits table per frequency position + soft-to-hard quant) trained
-  ONLINE against the real-codec bit counts (logged from x264/x265 during a
-  warmup pass) — i.e. the entropy model learns the TRUE rate of DCT blocks,
-  not a Gaussian-power surrogate.
+  one (K,) logits table per frequency position + soft-to-hard quant) trained by
+  MLE on its own symbols through the beta*bpp term of the objective — i.e. the
+  entropy model learns the DCT symbol distribution it actually sees, not a
+  Gaussian-power surrogate. It is NOT regressed against x264/x265 bit counts.
 - Strength head: the U-Net's only job is now the per-pixel strength s in [0,1]
   (sigmoid), trained with CE + distill + the LEARNED rate loss.
 
@@ -30,15 +30,17 @@ class LearnedRateCodec(VirtualCodec):
 
     The rate head is a tiny table: for each of the block*K*K DCT positions,
     K Laplacian components (mu, b) parameterise the symbol distribution;
-    expected bits = -log2 p(round(y)). Trained online (Adam, separate lr)
-    against the TRUE x264/x265 bit counts collected during training: every
-    step we also run the real codec on a small subsample (or reuse the STE
-    hook) and regress the prior's expected bits toward the real bit count of
-    the same block grid. Cheap (table only) and stays "frozen codec" — the
-    prior models the CODEC, not the content.
+    expected bits = -log2 p(round(y)). Trained online by its own Adam (see
+    engine._fit, lr 1e-3) by MINIMISING its own expected bits through the
+    objective's beta*bpp term — standard Ballé factorized-prior MLE, which
+    converges to the entropy of the symbols the quantiser produces. Cheap
+    (table only) and stays "frozen codec" — the prior models the CODEC, not
+    the content. There is deliberately NO regression against real x264/x265
+    bit counts: the real codec is never in the training forward pass (see
+    memory: three separate STE/real-forward attempts failed).
     """
 
-    def __init__(self, *a, n_components: int = 3, rate_lr: float = 1e-3, **kw):
+    def __init__(self, *a, n_components: int = 3, **kw):
         super().__init__(*a, **kw)
         bs = self.block
         n_pos = bs * bs
@@ -49,9 +51,7 @@ class LearnedRateCodec(VirtualCodec):
             "mu": nn.Parameter(torch.zeros(n_pos, n_components)),
             "b": nn.Parameter(torch.ones(n_pos, n_components) * 0.5),
         })
-        self.rate_lr = rate_lr
         self.rate_opt = None
-        self._real_bits_ema = None  # calibration target
 
     def _expected_bits(self, y: torch.Tensor) -> torch.Tensor:
         """y: [..., n_pos] quantised indices -> expected bits per coeff."""
@@ -86,16 +86,6 @@ class LearnedRateCodec(VirtualCodec):
         yv = y_hat.reshape(N * C, n_pos, nH, nW).movedim(1, -1)  # [N*C, nH, nW, n_pos]
         bits = self._expected_bits(yv).sum()
         return y_hat, bits
-
-    def calibrate_bits(self, real_bpp: float, n_pixels: int) -> float:
-        """EMA target from true codec bit counts; returns current mismatch."""
-        real_bits = real_bpp * n_pixels
-        if self._real_bits_ema is None:
-            self._real_bits_ema = real_bits
-        else:
-            a = 0.05
-            self._real_bits_ema = a * real_bits + (1 - a) * self._real_bits_ema
-        return float(self._real_bits_ema)
 
     # Route every inherited code path through the learned prior: the parent's
     # _code_yuv420/_code_rgb call self._quant_rate; shadow it with the

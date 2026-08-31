@@ -81,7 +81,12 @@ sigmoid. Đây là cơ chế duy nhất có thể cho gap ≥ 0 — mọi trục
 drop frame, resample) đều đã đóng vì trung hoà R-D (xem dưới).
 
 Lần chạy đầu **VOID** vì lỗi hiệu chuẩn proxy (xem "Bẫy hạ tầng #1"). Đã sửa ở
-commit `2101bf1`, cổng kiểm tra đã PASS, đang train lại.
+commit `2101bf1` — cổng đã PASS ở đây là *proxy-sanity* (identity qua proxy đã
+sửa: top-1 0.009→0.336–0.850) và demo `virtual_codec`, **không phải**
+`scripts/smoke_additive.py`, cái này hỏng từ lúc zero-init `to_rgb` cho tới khi
+được sửa. Train lại đã **xong** (6 epoch, 2h24m, best epoch 5) và đã định giá:
+gap dương thật ở QP45/50 nhưng BD dương ở 12/12 arm — xem
+`Desktop/vcm-additive-2026-08-31.txt`.
 
 ---
 
@@ -374,7 +379,7 @@ docs/
   RUN_DESIGN_additive.md   thiết kế + pre-registration + §5.2 quy nguyên nhân D10
   MODEL.md, IMPROVEMENTS.md, KAGGLE.md
 kaggle/   notebook Kaggle chạy ngay + launcher
-tests/    39 unit test, gồm self-check gate/smooth/entropy
+tests/    45 unit test, gồm self-check gate/smooth/entropy/additive
 ```
 
 Mọi module không tầm thường đều có self-check `__main__`:

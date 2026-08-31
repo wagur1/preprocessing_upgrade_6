@@ -112,7 +112,7 @@ def test_edit_kind_smooth() -> None:
 
     out = pre(x, cond)
     assert out.shape == x.shape
-    assert float(out.min()) >= -1e-6 and float(out.max()) <= 1.0 + 1e-6
+    assert float(out.min().detach()) >= -1e-6 and float(out.max().detach()) <= 1.0 + 1e-6
 
     # D3 invariant: output lies BETWEEN x and blur(x) per pixel (convex blend)
     blur = VideoPreprocessor._gaussian_blur(x)

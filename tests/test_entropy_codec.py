@@ -52,7 +52,7 @@ def test_quant_rate_learned_matches_parent_interface() -> None:
         coeff = torch.randn(*shape)
         y_hat, bits = cod._quant_rate_learned(coeff, step=0.1, training=False)
         assert y_hat.shape == coeff.shape
-        assert torch.isfinite(bits) and float(bits) > 0
+        assert torch.isfinite(bits) and float(bits.detach()) > 0
         assert torch.allclose(y_hat, torch.round(coeff / 0.1), atol=1e-6)
         y_hat_t, _ = cod._quant_rate_learned(coeff, step=0.1, training=True)
         assert not torch.allclose(y_hat_t, torch.round(coeff / 0.1))
@@ -69,14 +69,6 @@ def test_gradients_flow_to_rate_params() -> None:
     assert cod.rate_params["w"].grad.abs().sum() > 0
 
 
-def test_calibrate_bits_ema() -> None:
-    cod = LearnedRateCodec(qualities=(1,), block=8, colorspace="yuv420")
-    v1 = cod.calibrate_bits(0.5, 1000)
-    assert v1 == 500.0
-    v2 = cod.calibrate_bits(1.0, 1000)
-    assert 500 < v2 < 1000
-
-
 def test_full_forward_integration() -> None:
     """Engine-path forward: [B,C,T,H,W] -> (x_hat, bpp), grads to input+prior."""
     torch.manual_seed(2)
@@ -84,7 +76,7 @@ def test_full_forward_integration() -> None:
     x = torch.rand(2, 3, 4, 32, 32)
     x_hat, bpp = cod(x, 3)
     assert x_hat.shape == x.shape
-    assert torch.isfinite(bpp) and float(bpp) > 0
+    assert torch.isfinite(bpp) and float(bpp.detach()) > 0
     xg = x.clone().requires_grad_(True)
     xh, b = cod(xg, 3)
     (xh.mean() + b).backward()
@@ -99,6 +91,5 @@ if __name__ == "__main__":
     test_learned_prior_can_lower_bits_for_its_mode()
     test_quant_rate_learned_matches_parent_interface()
     test_gradients_flow_to_rate_params()
-    test_calibrate_bits_ema()
     test_full_forward_integration()
     print("entropy_codec self-checks passed")
