@@ -89,9 +89,26 @@ def test_coefficient_is_sized_against_the_task_term() -> None:
         f"a biting coefficient must be >= 3 for this term, got {biting}"
 
 
+def test_tv_counts_the_temporal_difference() -> None:
+    """TV must see flicker. A residual that is constant in time is cheap; one
+    that alternates frame to frame costs the codec its inter-frame budget, and a
+    spatial-only TV scores them identically (which ours did until 2026-08-31).
+    """
+    flat = torch.zeros(1, 3, 8, 16, 16)
+    steady = flat + 0.1                       # same every frame: no flicker
+    flicker = flat.clone()
+    flicker[:, :, ::2] = 0.1                  # alternates 0.1 / 0.0 in time
+    tv_steady, tv_flicker = (float(total_variation(v)) for v in (steady, flicker))
+    assert abs(tv_steady) < 1e-6, f"a constant clip has no variation: {tv_steady}"
+    assert tv_flicker > 0.01, f"temporal flicker must be counted: {tv_flicker}"
+    # and the 4D path must keep working (no time axis to difference)
+    assert float(total_variation(torch.zeros(1, 3, 16, 16))) == 0.0
+
+
 if __name__ == "__main__":
     test_default_is_off()
     test_targets_the_residual_not_the_source()
     test_penalises_spectrum_not_amplitude()
     test_coefficient_is_sized_against_the_task_term()
+    test_tv_counts_the_temporal_difference()
     print("gamma_res self-checks passed")

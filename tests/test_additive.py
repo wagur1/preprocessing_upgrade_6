@@ -108,6 +108,26 @@ def test_identity_at_init() -> None:
     assert torch.equal(y, x), "untrained additive model must be exact identity"
 
 
+def test_temporal_context_is_causal_and_per_frame() -> None:
+    """The temporal branch must be a CAUSAL per-frame window, not a clip constant.
+
+    Until 2026-08-31 the branch stacked the clip's centre 8 frames once and
+    broadcast the result to every frame (`repeat_interleave`), so it contributed
+    a per-clip constant and the residual could not follow motion. Perturbing one
+    input frame pins the corrected behaviour exactly: window i spans frames
+    [i-7 .. i], so a change at frame 8 must leave frames 0-7 bit-identical and
+    move every frame from 8 to 15.
+    """
+    pre = _trained_like()
+    x = torch.rand(2, 3, 16, 48, 48)
+    x2 = x.clone()
+    x2[:, :, 8] = torch.rand_like(x2[:, :, 8])
+    with torch.no_grad():
+        d = (pre(x) - pre(x2)).abs().mean(dim=(0, 1, 3, 4))   # keep the time axis
+    assert float(d[:8].max()) == 0.0, f"causality violated: {d[:8].tolist()}"
+    assert float(d[8:].min()) > 1e-7, f"no temporal reach: {d[8:].tolist()}"
+
+
 if __name__ == "__main__":
     test_param_count()
     test_strict_loads_best_pt()
@@ -116,4 +136,5 @@ if __name__ == "__main__":
     test_gradients_flow_to_every_branch()
     test_strength_is_the_operating_point()
     test_identity_at_init()
+    test_temporal_context_is_causal_and_per_frame()
     print("additive self-check passed")

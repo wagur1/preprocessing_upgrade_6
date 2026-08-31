@@ -64,13 +64,24 @@ class LossWeights:
 
 
 def total_variation(x: torch.Tensor) -> torch.Tensor:
-    """Mean spatial total variation of x (last two dims are H, W).
+    """Mean spatio-TEMPORAL total variation of x. 4D (B,C,H,W) or 5D (B,C,T,H,W).
 
-    Codec-agnostic proxy for encode cost: sum of |neighbour pixel differences|.
-    Works for 4D (B,C,H,W) and 5D (B,C,T,H,W) tensors alike."""
+    Codec-agnostic proxy for encode cost: sum of |neighbour differences| over
+    height, width AND time. The temporal term is not decoration -- a video codec
+    spends most of its bits on the INTER-FRAME residual, so a TV that stops at
+    (h, w) is blind to the dominant cost. A residual that flickers frame to frame
+    is expensive on x264/x265 and a spatial-only penalty cannot see it at all.
+
+    Adopted from munnn01/proxy_v3 (`masked_total_variation`, train.py:163-177,
+    with permission), which carries all three differences; this function had
+    only two until 2026-08-31. Historical `gamma` runs (robust_transfer.yaml
+    0.03, universal 0.01) were measured against the spatial-only version."""
     dh = (x[..., 1:, :] - x[..., :-1, :]).abs().mean()
     dw = (x[..., :, 1:] - x[..., :, :-1]).abs().mean()
-    return dh + dw
+    tv = dh + dw
+    if x.ndim == 5:                      # (B,C,T,H,W): time is dim 2
+        tv = tv + (x[:, :, 1:] - x[:, :, :-1]).abs().mean()
+    return tv
 
 
 

@@ -16,8 +16,23 @@ to recover. Chosen here (Zhao-faithful reading):
   * residual connection in the spatial branch (``sp = stem + body``);
   * sigmoid gate, convex blend fusion ``gate*sp + (1-gate)*tp`` (the paper's
     "conditional attention" between the temporal and spatial branches);
-  * temporal context = the CENTER 8 frames of the clip, stacked on channels;
+  * temporal context = a CAUSAL 8-frame window ENDING at the current frame,
+    stacked on channels, left-padded by repeating frame 0 (changed 2026-08-31,
+    see below);
   * output clamped to [0,1].
+
+Temporal wiring, resolved against an independent implementation (2026-08-31).
+The original reading stacked the clip's CENTER 8 frames ONCE and broadcast the
+resulting feature map to every output frame (``repeat_interleave``), so the
+temporal branch contributed a per-clip CONSTANT: the residual could not vary
+with motion, and for a 16-frame clip the edit applied to frame 0 was computed
+from frames 4-11. munnn01/proxy_v3's ``PaperPreprocessor`` -- an independent
+reading of the same paper, with the identical module tree (3->16, 16->16->16,
+24->16, 32->16->16, 16->3), the identical sigmoid-gate convex blend, and the
+same zero-init to_rgb, all arrived at separately -- uses a CAUSAL window ending
+at the current frame instead. That reading is adopted here: it is the only one
+under which the branch is temporal at all. Parameter count, key names and shapes
+are unchanged (9,795), so ``best.pt`` still loads with ``strict=True``.
 
 The model is UNCONDITIONED (no QP input) and UNGATED (no saliency mask) by
 design: Zhao train one robust model across the whole rate range, and the
@@ -85,15 +100,14 @@ class AdditivePreprocessor(nn.Module):
         body = self.spatial_residual.body
         sp = sp + body[2](F.relu(body[0](sp)))
 
-        if t >= self.tframes:
-            start = (t - self.tframes) // 2
-            ctx = x[:, :, start:start + self.tframes]
-        else:  # short clip: pad the temporal context by repeating the last frame
-            pad = x[:, :, -1:].expand(b, c, self.tframes - t, h, w)
-            ctx = torch.cat([x, pad], dim=2)
-        stack = ctx.permute(0, 2, 1, 3, 4).reshape(b, self.tframes * c, h, w)
-        tp = F.relu(self.temporal_stem(stack))
-        tp = tp.repeat_interleave(t, dim=0)     # clip-level map broadcast over T
+        # Causal window per output frame: frame i sees frames [i-tf+1 .. i], with
+        # frame 0 repeated on the left when the context is short. Left-pad by
+        # tf-1 then unfold, so window i ends exactly at frame i.
+        pad = x[:, :, :1].expand(b, c, self.tframes - 1, h, w)
+        padded = torch.cat([pad, x], dim=2)                      # [B,C,T+tf-1,H,W]
+        win = padded.unfold(2, self.tframes, 1)                  # [B,C,T,H,W,tf]
+        stack = win.permute(0, 2, 5, 1, 3, 4).reshape(b * t, self.tframes * c, h, w)
+        tp = F.relu(self.temporal_stem(stack))   # per-frame, no broadcast
 
         gate = torch.sigmoid(
             self.fusion.gate[2](F.relu(self.fusion.gate[0](torch.cat([sp, tp], dim=1)))))

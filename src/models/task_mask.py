@@ -74,7 +74,16 @@ def masked_tv(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     dw = (x[..., :, 1:] - x[..., :, :-1]).abs()
     wh = weight[..., 1:, :]
     ww = weight[..., :, 1:]
-    return (dh * wh).mean() + (dw * ww).mean()
+    out = (dh * wh).mean() + (dw * ww).mean()
+    if x.ndim == 5 and weight.ndim == 5 and weight.shape[2] == x.shape[2]:
+        # Temporal difference, same reason as total_variation(): the inter-frame
+        # residual is where a video codec spends most of its bits. Each pair takes
+        # the SMALLER of its two endpoint weights so detail bordering a protected
+        # region stays protected (proxy_v3's rule, train.py:163-177).
+        dt = (x[:, :, 1:] - x[:, :, :-1]).abs()
+        wt = torch.minimum(weight[:, :, 1:], weight[:, :, :-1])
+        out = out + (dt * wt).mean()
+    return out
 
 
 def _demo() -> None:
