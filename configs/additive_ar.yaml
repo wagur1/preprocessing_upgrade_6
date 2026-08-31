@@ -74,7 +74,12 @@ loss:                     # L = lam_task*L_task + mu*L_D + beta*bpp  (Zhao form)
   beta: 0.001             # lambda of Zhao et al. (alpha=10, lambda=0.001)
   tau: 0.0
   delta: 0.0
-  gamma: 0.0
+  gamma: 0.0              # TV of x_pre -- WRONG TARGET for an additive model:
+                          # source-dominated. Swept 0.01/0.03/0.1 on 2026-08-31,
+                          # all three residuals within 0.7% RMS of gamma=0.
+  gamma_res: 0.0          # TV of the RESIDUAL x_pre-x. This is the bit-cost
+                          # lever for an additive edit. Size it against L_task
+                          # (~3.3): TV(res) ~ 6e-3, so <1 is decorative, >=10 bites.
   mu: 10.0                # alpha=10 MSE-to-source on the proxy reconstruction
   use_task_mask: false
 

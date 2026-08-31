@@ -1,7 +1,7 @@
 """Training objective for the machine-vision video preprocessor (upgrade2).
 
     L = lam_task * L_task + omega * L_distill + beta * L_rate + tau * L_temp
-        (+ delta * L_delta) (+ gamma * L_tv) (+ mu * L_D)
+        (+ delta * L_delta) (+ gamma * L_tv) (+ gamma_res * L_tv_res) (+ mu * L_D)
 
 By default there is **no MSE-to-source distortion term**. That term (the
 baseline's ``L_D``) pins the reconstruction to the original pixels; against a
@@ -58,6 +58,7 @@ class LossWeights:
     tau: float = 0.1     # temporal consistency
     delta: float = 0.0   # L1 edit-magnitude |x_pre-x| (edit sparsity; 0 = off)
     gamma: float = 0.0   # total-variation of x_pre (codec-agnostic bit cost; 0 = off)
+    gamma_res: float = 0.0  # total-variation of the RESIDUAL x_pre-x (0 = off)
     mu: float = 0.0      # MSE-to-source L_D (paper's distortion term; 0 = off)
     use_task_mask: bool = False  # A2: weight gamma/delta by task saliency (spatial)
 
@@ -141,6 +142,28 @@ def preprocessing_loss(
         total = total + w.gamma * l_tv
     else:
         l_tv = x_hat.new_zeros(())
+    # Same idea as gamma, but on the RESIDUAL instead of the output. For an
+    # ADDITIVE preprocessor (x_pre = x + s*r) gamma is the wrong target twice
+    # over: TV(x_pre) is dominated by the SOURCE video's own texture, so most of
+    # the penalty lands on content the preprocessor did not create, and driving
+    # it down means blurring the source -- i.e. rebuilding the subtractive family
+    # that is already measured R-D neutral. TV(r) penalises only the spectrum of
+    # what the model ADDS, which is what makes an additive edit expensive on a
+    # DCT codec, and leaves the source alone.
+    #
+    # SCALE, learned the hard way (gamma sweep 0.01/0.03/0.1, 2026-08-31, 7.5
+    # GPU-hours for zero information): TV here is ~6e-3 against a task loss of
+    # ~3.3, so a coefficient under ~1 contributes <0.2% of the objective and
+    # changes nothing measurable -- three runs 10x apart in gamma produced
+    # residuals within 0.7% RMS of each other AND of the gamma=0 baseline. Size
+    # this against the task term (c*TV / L_task), never by copying a coefficient
+    # from a config written for a different mechanism.
+    if w.gamma_res and x_pre is not None:
+        res = x_pre - x_source
+        l_tv_res = masked_tv(res, bg) if bg is not None else total_variation(res)
+        total = total + w.gamma_res * l_tv_res
+    else:
+        l_tv_res = x_hat.new_zeros(())
     # MSE-to-source L_D (Zhao et al.): pins the reconstruction to the source.
     # We dropped it originally because it fought compression -- but that was
     # against a mismatched (wavelet) proxy. The paper KEEPS it heavy (alpha=10)
@@ -159,5 +182,6 @@ def preprocessing_loss(
         "loss_temp": l_temp.detach(),
         "loss_delta": l_delta.detach(),
         "loss_tv": l_tv.detach(),
+        "loss_tv_res": l_tv_res.detach(),
         "loss_d": l_d.detach(),
     }

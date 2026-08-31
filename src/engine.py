@@ -331,6 +331,7 @@ def _fit(cfg, pre, codec, analyzer, train_loader, val_loader, prep_batch,
         tau=lw.get("tau", 0.1),
         delta=lw.get("delta", 0.0),
         gamma=lw.get("gamma", 0.0),
+        gamma_res=lw.get("gamma_res", 0.0),
         mu=lw.get("mu", 0.0),
         use_task_mask=bool(lw.get("use_task_mask", False)),
     )
@@ -483,6 +484,7 @@ def _fit(cfg, pre, codec, analyzer, train_loader, val_loader, prep_batch,
                              tmp=f"{vals['loss_temp']:.4f}",
                              dlt=f"{vals['loss_delta']:.4f}",
                              tv=f"{vals['loss_tv']:.4f}",
+                             tvr=f"{vals['loss_tv_res']:.4f}",
                              lr=f"{lr_now:.1e}", qp=qp)
             tracker.log_step(step, {**vals, "lr": lr_now, "qp": qp})
             if max_steps and step >= max_steps:
