@@ -268,6 +268,59 @@ mechanism, and §5.1's screen tables describe a model trained against an unrecog
 The r128/r224 screens and the no-codec diagnostic keep their value only as the audit trail that
 found this.
 
+## 5.3 RERUN DONE (2026-08-31, commit `2101bf1`) -- the first VALID additive round
+
+Train: 6 epochs in **2h24m** (~23 min/epoch, not the ~90 this doc estimated in §4 -- corrected
+there), val_loss 3.0975 -> 1.3228 monotone, best epoch 5, task CE QP-graded and alive (QP30
+0.098-2.82 ... QP50 5.60-9.04, i.e. below `ln 400 = 5.991` where the void round never got).
+Residual RMS 0.125 at s=1.0, ~half the void checkpoint's 0.245.
+
+Screen r128, 113 val clips, real x264/x265, held-out `r2plus1d_18`:
+
+| codec | anchor bpp / top1 | s=1.0 bpp / top1 | dbpp | dacc@QP45 (boot5%) |
+|---|---|---|---|---|
+| h264 | 0.1364 / 0.5027 | 0.2210 / 0.5841 | **+62.0%** | **+0.195 (+0.124)** |
+| h265 | 0.1708 / 0.4867 | 0.2505 / 0.5611 | **+46.7%** | **+0.168 (+0.097)** |
+
+**Accuracy is real and significant -- a first for this project.** `pick_s.py` still refuses every
+arm, but note it fails on the `dbpp <= 0` clause, which a purely additive residual can never
+satisfy at any s > 0 (adding signal adds entropy). That clause was written for subtractive
+prefilters; the meaningful test here is BD, and **BD is positive at 12/12 arms** (best -0.19%
+h264 s=0.02; +15.28% / +13.83% at s=1.0). QP-gating does not rescue it and cannot: BD on the
+accuracy axis cannot credit a gain BELOW the anchor's own accuracy range (anchor QP45/50 =
+0.327/0.097, the edit lifts them to ~0.52/0.26, overlap becomes [0.257, 0.814]), and gating
+truncates that overlap further.
+
+**Ceiling analysis (`u6_big4/ceiling.py`) -- accuracy is NOT the bottleneck, bit cost is.**
+Holding measured accuracy fixed and scaling the edit's cost to k x its real value:
+
+| protocol / codec | 100% | 75% | 50% | 25% | 0% |
+|---|---|---|---|---|---|
+| held-out h264 | -0.19% | -0.61% | -3.82% | -10.90% | **-19.76%** |
+| held-out h265 | +0.96% | +0.21% | -0.98% | -4.39% | **-10.49%** |
+
+The gain already in hand is worth -19.76% on h264 if the residual were free -- past the -11%
+needed to certify -8% at n=1159. **h265's ceiling is -10.49% even at zero cost**, so a certified
+-8% on h265 is out of reach for additive editing regardless of how cheap the residual gets.
+Read the table as an upper bound, not a forecast: amplitude and cost are coupled (the s-grid IS
+that curve), so moving rightward requires changing the residual's SPECTRUM, not its amplitude.
+
+**Why the residual is expensive, and the lever that was never pulled.** `configs/additive_ar.yaml`
+ships `gamma: 0.0` (TV) and `delta: 0.0` (L1 edit magnitude) with `beta: 0.001` that its own
+comment calls decorative -- the objective never asked for a *cheap* residual. `edit_size.py`
+measures TV rising to **1.39x** on smooth input at s=1.0: the residual adds high-frequency
+structure, the priciest thing for a DCT codec. `src/losses.py:32-38` already names `gamma` as
+"the lever for transfer to x264/x265 (unlike `beta*bpp`, which only reduces the *proxy* codec's
+bits)" -- and `beta` is the wrong knob here anyway, since the proxy is calibrated on PSNR and its
+bpp is not trustworthy as an optimisation target (Trap #1).
+
+**In flight:** a 3-point `gamma` sweep (0.01 / 0.03 / 0.1; 0.03 is `robust_transfer.yaml:49`'s
+"transfer-oriented setting from the repo ablation") at commit `0399f53`, one variable, three
+accounts in parallel. Thresholds were pre-registered before the data existed -- see
+`Desktop/vcm-additive-2026-08-31.txt` §13. Note that even a full PASS there lands at k~0.5
+(-3.82%), so it tests whether the accuracy/cost trade *exists*; it does not by itself reach the
+target.
+
 ## 6. Outcome interpretations (decided in advance)
 
 **Pre-registered expectations (pinned BEFORE any number, per 2026-08-31 review):**

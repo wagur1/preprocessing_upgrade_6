@@ -15,7 +15,7 @@ cùng một bitrate, máy vẫn nhìn thấy thứ nó cần.
             + SFT(motion)              (train qua proxy yuv420) + 1 analyzer HELD-OUT khi eval
             + D1 GATE: edit *= (1−M)   M = saliency task của analyzer đóng băng
             hoặc D4.5: ramp theo QP    (kết quả không-cần-train)
-            hoặc D10: residual cộng    (họ additive, đang chạy lại)
+            hoặc D10: residual cộng    (họ additive, đã định giá 31/08)
 ```
 
 Đại lượng được tối ưu là **độ lợi của bộ tiền xử lý trên *cùng* một codec**:
@@ -73,7 +73,7 @@ BD ≈ exp(−slope · Δacc) − 1        slope = 2.45 (h264), 2.9 (h265 @224)
 video gốc gần 5 điểm, không chỉ "không làm hỏng". Mô hình này *thiên vị* các Δacc
 lớn (dạng exp), nên với Δacc > 0.05 phải đo thật thay vì ngoại suy.
 
-### Vòng đang chạy
+### Vòng mới nhất
 
 **D10 — họ additive** (`src/models/additive.py`, 9.795 tham số, theo Zhao et al.):
 `x_pre = x + s · to_rgb(fused)`, hai nhánh không-gian/thời-gian trộn bằng cổng
@@ -142,7 +142,7 @@ phải lưới QP** — điều này cũng khai tử luôn đề xuất "lưới
 | chroma | **đóng** | bỏ chroma **hoàn toàn** chỉ tiết kiệm 3–6% bitstream |
 | cấu hình encoder theo codec | **đóng** | `g224` BD ≈ 0, gap h264 FAIL |
 | hình học 224 + bỏ octave trên cùng | **đóng** | `g224` / `r96`; analyzer resize về 112 nên octave trên vô hình, nhưng bỏ nó vẫn không thắng |
-| **residual cộng (additive, gap ≥ 0)** | **live** | trục duy nhất còn lại; vòng D10 đang chạy lại |
+| **residual cộng (additive, gap ≥ 0)** | **đã định giá, CHƯA đóng** | gap dương thật (+0.195 @QP45 h264, boot5% +0.124) — lần đầu trong cả dự án; nhưng BD **dương ở 12/12 arm**. Chưa đóng vì hạng chi phí bit chưa từng có trong objective (`gamma: 0.0`), sweep `gamma` đang chạy |
 
 Một kết quả âm trong dòng phân bổ rate đáng giữ lại: **bản đồ saliency có mang
 thông tin thật**. Bảo vệ *nửa sai* số block (cùng số lượng, mask lật ngược) làm mất
@@ -318,7 +318,7 @@ analyzer". Mọi cách sửa phía loss đều đã thử và thất bại ⇒ t
 | **D4.5** | bỏ hẳn việc học: ramp cố định theo QP | **kết quả dương đầu tiên**, BD −1.99%/−2.34%, 9/9 quan sát seed×codec đều âm |
 | **D5–D7** | lưới 17 cấu hình quanh ramp60 | phong cảnh lõm, blur heuristic **bão hoà ở ≈−3%**; đẩy strength mạnh hơn làm BD *xấu đi* +2…+5% |
 | **D8** | thay rate model chết bằng prior factorized có train | mở đường, nhưng bị bảng 1159-clip vượt qua |
-| **D10** | residual **cộng** kiểu Zhao (trục duy nhất còn sống) | lần 1 VOID vì Bẫy #1; đang chạy lại |
+| **D10** | residual **cộng** kiểu Zhao (trục duy nhất còn sống) | lần 1 VOID vì Bẫy #1. Chạy lại `2101bf1` **hợp lệ**: 6 epoch/2h24m, gap dương thật ở QP45/50 nhưng BD dương 12/12 arm. Phân tích trần: accuracy **đã đủ** (−19.76% h264 nếu residual miễn phí), điểm nghẽn là **chi phí bit** (+62%) |
 
 **Nguyên nhân gốc của D3/D4** (đọc thẳng từ `VirtualCodec._quant_rate`): rate model
 là công thức Gaussian-power không tham số `R = ½·log2(1 + 12·E[y²])`. Khi nền đã bị
