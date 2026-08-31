@@ -1,642 +1,532 @@
 # preprocessing_upgrade_6
 
-**Universal, analyzer-agnostic video preprocessing for Video Coding for Machines (VCM), in front of a *frozen* standard codec (x264 / x265).**
+**Tiền xử lý video phổ quát, không phụ thuộc analyzer, cho VCM (Video Coding for
+Machines), đặt trước một codec chuẩn *đóng băng* (x264 / x265).**
 
-Only a small preprocessor network is trained. The video codec and every downstream
-vision model ("analyzer") stay frozen and standard — no bitstream changes, no
-decoder changes, no per-CTU QP maps. The preprocessor edits pixels *before*
-encoding so that, at the same bitrate, a machine still sees what it needs.
-
-> 🇻🇳 **Tóm tắt.** Bản nâng cấp 6 của pipeline tiền xử lý VCM. Toàn bộ hạ tầng
-> 5.1 (A1 multi-teacher, A2 task-mask, A3 STE, C1 yuv420 proxy, C2 in-grid QP)
-> được giữ nguyên. Chuỗi đóng góp D-series (30 biến thể, ~40 GPU-giờ):
-> **(D1/D2)** gate saliency cấu trúc `x_pre = x + (1−M)·edit` — vùng task là
-> identity chính xác, nhưng residual edit vẫn học ra nhiễu tốn +5% bit.
-> **(D3/D4)** chứng minh bất khả thi: 5 cấu hình học (kể cả STE) đều chỉ ra
-> identity vì rate-gradient Gaussian-power chết dưới quantizer step.
-> **(D4.5)** kết quả dương đầu tiên của dự án — **ramp60 zero-training**:
-> `x_pre = x + s(QP)·(1−M)·(blur(x)−x)` đạt **BD-rate −2.0%/−2.3%** (9/9 seed
-> âm, BD-accuracy dương) — thắng mọi biến thể học và ngang/băn Zhao reproduce
-> cùng 3GB data. **(D8)** entropy prior có train thay rate-model chết — mở
-> đường cho phần learned phải thắng heuristic.
+Chỉ một mạng tiền xử lý nhỏ được huấn luyện. Codec và mọi mô hình thị giác phía
+sau ("analyzer") giữ nguyên, đúng chuẩn — không sửa bitstream, không sửa decoder,
+không bản đồ QP theo CTU. Bộ tiền xử lý sửa pixel *trước khi* encode, sao cho ở
+cùng một bitrate, máy vẫn nhìn thấy thứ nó cần.
 
 ```
-                     (trained)              (FROZEN)                 (FROZEN panel)
- video x ─► Preprocessor θ ─► x_pre ─► Standard codec ─► x̂ ─► Analyzer(s) ─► machine label
-            U-Net + FiLM(rate)          x264 / x265                r3d_18 / mc3_18 / …
-            + SFT(motion)               (yuv420 proxy at train)    + a HELD-OUT analyzer at eval
-            + D1 GATE: edit *= (1-M)    M = task saliency of the frozen analyzer
-            or D4.5: fixed QP-ramp      (zero-training headline result)
-            or D8: learned-rate prior   (entropy model, in progress)
+                    (được train)            (ĐÓNG BĂNG)              (panel ĐÓNG BĂNG)
+ video x ─► Preprocessor θ ─► x_pre ─► Codec chuẩn ─► x̂ ─► Analyzer(s) ─► nhãn cho máy
+            U-Net + FiLM(rate)         x264 / x265              r3d_18 / mc3_18 / …
+            + SFT(motion)              (train qua proxy yuv420) + 1 analyzer HELD-OUT khi eval
+            + D1 GATE: edit *= (1−M)   M = saliency task của analyzer đóng băng
+            hoặc D4.5: ramp theo QP    (kết quả không-cần-train)
+            hoặc D10: residual cộng    (họ additive, đang chạy lại)
 ```
 
-The claim we optimize is the **preprocessor gain on the *same* codec**:
-`BD-Rate(prep+x265 vs x265)` and `BD-Rate(prep+x264 vs x264)` — negative means the
-preprocessor lets the machine reach the same accuracy at fewer bits. (Cross-codec
-comparisons are reported too, but QP is not comparable across codecs, so they are
-reference-only.)
-
-> **Status (2026-08-30).** The D-series sections below are kept as written, on their original
-> 207-clip protocol. They have since been re-measured on **1159 clips with clip-level
-> confidence intervals**, and the conclusion changed: the analytic family's effect is ≈0 ± 3%
-> and no variant yet meets the target. Start at
-> [The full-dataset chapter](#the-full-dataset-chapter-1159-clips-2026-08-30--what-survived)
-> for the current state; read the D-series for how it was arrived at.
+Đại lượng được tối ưu là **độ lợi của bộ tiền xử lý trên *cùng* một codec**:
+`BD-Rate(prep+x265 vs x265)` và `BD-Rate(prep+x264 vs x264)` — âm nghĩa là bộ
+tiền xử lý giúp máy đạt cùng độ chính xác với ít bit hơn. (So sánh chéo codec vẫn
+được báo cáo, nhưng QP không so được giữa hai codec nên chỉ mang tính tham chiếu.)
 
 ---
 
-## Why upgrade-6 (what ended upgrade-5.1)
+## Trạng thái dự án (2026-08-31) — đọc mục này trước
 
-5.1's first two full 3-seed runs came out **negative** (`prep+h264 +2.1 %`,
-`prep+h265 +3.2 %`; replicated +9.6 %/+12.2 % — STE stage flips between
-near-identity and kept-destructive per seed). A systematic 11-variant
-loss-weight campaign (2026-08-27/28, single seed, Stage-1 only) then mapped the
-whole reachable space:
+Mọi con số phía dưới trong lịch sử D-series được đo trên **207 clip**. Chúng đã
+được đo lại trên **1159 clip** với khoảng tin cậy ở mức clip, và kết luận đã đổi.
 
-| variant | change | mean QP30-gap | outcome |
-|---|---|---|---|
-| control | μ=10, λ_task=1, β=0.01 | −0.310 | pathology: edits cut bpp by destroying ~30 acc points at QP30 |
-| mu3 / task3 / beta003 | μ→3 / λ_task→3 / β→0.003 | −0.254 / −0.333 / −0.295 | no single knob closes the gap |
-| flatkill (γ=δ=0) | remove flattening pressures | −0.321 | not the cause |
-| **distill2 (ω=2)** | raise distillation | **−0.213** | best of all; still fails −0.05 |
-| distill5 (ω=5) | distillation saturation | −0.305 | ω peaks at 2 |
-| noqp50 (drop QP50 from train) | curriculum | −0.317 | dead-QP curriculum doesn't rescue |
-| zhao-bridge (μ=10, β=0.001, γ=δ=0 — the paper's exact loss) | transfer test | −0.298, BD +87 %/+60 % | **Zhao's loss does not transfer to our infra** |
+**Số duy nhất còn đứng vững theo protocol chuẩn** (1159 clip, fingerprint
+`30f083f8520a`, analyzer held-out `r2plus1d_18`, QP 30–50, preset medium):
 
-Two mechanisms were established: (i) the task cross-entropy **dies to random-guess**
-under proxy-codec damage at heavy QPs (train logs: task ≈ ln 400), so during most
-of training there is *no accuracy-preserving gradient*; (ii) with no live task
-signal, the remaining pressures steer the edit into "cheap for the codec, unreadable
-for the analyzer". Every loss-side fix was tried and failed ⇒ the failure is
-**structural**.
-
-**D1 removes the failure mode by construction.** The edit is gated per-pixel by the
-frozen analyzer's saliency: task-critical pixels are an exact identity — no loss
-term can trade their accuracy for rate — and the network is free to spend its
-creativity on the background, where bits are wasted anyway. This is the
-pixel-domain analogue of prompt-guided prefiltering (Azizian & Bajić, ICME 2026,
-arXiv:2604.00314: keep task-relevant regions, smooth the rest, 25–50 % savings
-with unchanged accuracy) and inherits the A2 saliency machinery already in the
-harness — promoted from a *loss reweighting* (a pressure the optimizer can
-override) to a *forward-pass structure* (which it cannot).
-
-Design invariants:
-
-* loss weights in `configs/universal_action_recognition.yaml` are **identical to
-  5.1** — the gate is the single changed variable, so any delta vs the 11-variant
-  campaign attributes to D1;
-* the mask is **detached** (no second-order gradients), cheap (one extra backward
-  through the frozen analyzer, already computed for A2);
-* at eval the gate mask comes from the **eval analyzer** (held-out backbone) —
-  train/eval consistency, and the honest "universal" reading: protection regions
-  derived from whichever frozen analyzer will consume the stream;
-* `model.gate: false` reproduces 5.1 exactly (ablation arm).
-
-## The upgrade-6 D-series: from gated learning to structure-only (2026-08-28/29)
-
-The D-series is a 30-variant, ~40-GPU-hour campaign run through the Kaggle API.
-Every stage kept the harness, protocol and eval fixed (3 GB Kinetics subset,
-207 test clips, held-out `r2plus1d_18`, QP grid [30…50], preset medium) so all
-numbers are directly comparable. Selection rule throughout: **QP30 accuracy gap
-≥ −0.05 on both codecs** (the light-QP damage 5.1 could never avoid).
-
-### D1/D2 — structural saliency gating (necessary, not sufficient)
-
-| variant | QP30-gap (h264/h265) | BD-rate | bpp |
-|---|---|---|---|
-| 5.1 control (no gate) | −0.319 / −0.300 | +75.5% / +41.5% | ~1% |
-| D1 soft gate | −0.251 / −0.251 | +69.6% / +46.1% | ~1% |
-| D2 hard gate 50% (`model.gate_area`) | −0.188 / −0.159 | +41.0% / +36.2% | **+5%** |
-
-The gate works exactly as designed (protected regions are bit-exact identity;
-QP30-gap recovers by a third) — but the *residual* edit the U-Net still learns is
-**rate-adding noise**: real x264/x265 bitrates went **up ~5%** at every QP. With
-μ=10 (MSE-to-source) penalising real smoothing, the free-residual editor's best
-strategy is feature-preserving noise — expensive for the codec, confusing for the
-analyzer.
-
-### D3/D3.1/D4 — the learning impossibility proof (5 independent configurations)
-
-Parameterising the edit as a convex blend toward blur
-(`model.edit_kind=smooth`: `x_pre = x + s·(blur(x) − x)`, s∈[0,1] — smoothing
-that *cannot* add detail) should make "cheaper than source" the only reachable
-direction. Instead, **every configuration learned the exact identity (s≈0,
-bpp-div 0.0%, BD 0.00%)**:
-
-| config | μ | mask | codec | result |
+| biến thể | cơ chế | BD h264 [CI95] | BD h265 | luật gap |
 |---|---|---|---|---|
-| D3 smooth50 | 10 | hard 50% | virtual | identity |
-| D3.1 free50 | **0** | hard 50% | virtual | identity |
-| D3.1 free50_m1 | 1 | hard 50% | virtual | identity |
-| D3.1 freesoft | 0 | soft | virtual | identity |
-| D4 ste_fix / ste_free | 0 | hard/soft | **STE (real codec fwd)** | identity |
+| `t_base` | ramp blur + saliency mask tĩnh | **−3.41%** [−5.67, −1.24] | −0.26% | PASS (−0.015) |
+| `x_base` | như trên, mask từ analyzer **held-out** | −2.65% [−4.64, −0.49] | **−1.43%** | PASS (−0.011) |
+| `f_s4` | strength phẳng s=0.4 | −1.14% [−3.44, +0.98] | −0.21% | PASS (−0.029) |
+| `tdup6` | giữ frame theo thời gian, mỗi frame thứ 6 | **−8.18%** [−11.30, −5.22] | −0.23% | **FAIL (−0.176)** |
+| `g224` | cờ encoder theo từng codec, `frame_size` 224 | −0.65% [−3.81, +2.32] | −0.84% | FAIL (−0.072) |
+| `r96` | resample vòng về 96² | +8.54% [+5.57, +11.60] | +8.69% | FAIL (−0.144) |
+| `lo_s7` | s=0.7 phẳng trên lưới QP20–40 | +9.28% [+2.70, +15.06] | +5.62% | FAIL (−0.066) |
 
-Root cause (read straight off `VirtualCodec._quant_rate`): the rate model is the
-parameter-free Gaussian-power formula `R = ½·log2(1 + 12·E[y²])`. Once the
-background is blurred, DCT coefficients fall below the quantiser step and
-`∂R/∂s → 0` — the rate gradient **dies exactly where smoothing would pay**.
-The always-alive CE gradient then pushes s→0 unopposed. STE does not help
-because its *backward* is still the proxy's. (Historical note: the first D3 run
-"passed" with −12…−20% bpp — a silent eval bug loaded smooth weights into the
-residual architecture; fixed in `80724ab`, `evaluate()` now restores
-architecture hyper-parameters from the config stored inside every checkpoint.
-Lesson: instrument the forward pass before believing good numbers.)
+**Luật gap** (quy tắc tuyển chọn xuyên suốt): chênh lệch độ chính xác
+`prep − anchor` phải **≥ −0.05 tại mọi QP** trên cả hai codec. Vi phạm là bị loại,
+BD-rate đẹp cỡ nào cũng không cứu.
 
-### D3.2/D4.5 — structure without learning: the first positive result
+**Chưa biến thể nào đạt mục tiêu công bố** (BD ≤ −8% trên *cả hai* codec, gap PASS).
+Cái vượt −8% duy nhất — `tdup6` — hỏng gap gấp 3.5 lần luật.
 
-If learning through the untrained rate model is impossible, drop the learning:
-the **fixed-s ramp** is pure analysis — zero parameters, zero checkpoints, immune
-to the entire bug class above.
+**Số học để chứng nhận:** với n=1159, CI ≈ ±3 điểm phần trăm, nên muốn *claim*
+≤ −8% thì phải **đo được ≤ −11%**. Đây là ngưỡng thật, không phải −8%.
+
+### Mô hình độ dốc: đổi accuracy ra bit
+
+Quan hệ thực nghiệm giữa gap độ chính xác và BD-rate, fit trên các vòng đã đo:
 
 ```
-x_pre = x + s(QP)·(1 − M)·(blur(x) − x)
-M     = top-AREA% saliency per clip (hard mask, D2 machinery)
-s(QP) = [30: 0.0, 35: 0.2, 40: 0.4, 45: 0.7, 50: 1.0]   (QP-adaptive ramp)
-blur  = gaussian 5×5, σ=2
+BD ≈ exp(−slope · Δacc) − 1        slope = 2.45 (h264), 2.9 (h265 @224)
 ```
 
-The QP-ramp exists because per-QP analysis of the fixed-smoothing pilot showed
-mid-QP (35–40) was the accuracy killer while QP45–50 was already winning
-(−6.4% bpp @ −0.029 gap) — so smoothing switches on only where it pays.
-
-**ramp60 (AREA=0.60), 3 seeds, 9/9 seed×codec observations negative:**
-
-| | h264 | h265 |
+| Δacc cần có | BD h264 kỳ vọng | BD h265 kỳ vọng |
 |---|---|---|
-| BD-rate mean | **−1.99%** | **−2.34%** |
-| BD-accuracy mean | +0.010 | +0.019 |
-| QP30-gap | +0.000 | +0.000 |
+| +0.00 | 0% | 0% |
+| +0.02 | −4.8% | −5.6% |
+| +0.03 | −7.1% | −8.3% |
+| +0.05 | −11.5% | −13.5% |
 
-This is the project's first positive result, and it beats *every* learned variant
-of the 5.1/u6 campaign with zero training. (CI95 with n=3 still spans 0 —
-reported honestly as "consistently negative across all seeds", not p<0.05.)
+Đọc theo chiều ngược lại: muốn đo được −11% (ngưỡng chứng nhận), cần
+**Δacc ≈ +0.048 trên h264** — tức bộ tiền xử lý phải làm analyzer chính xác **hơn**
+video gốc gần 5 điểm, không chỉ "không làm hỏng". Mô hình này *thiên vị* các Δacc
+lớn (dạng exp), nên với Δacc > 0.05 phải đo thật thay vì ngoại suy.
 
-### D5–D7 — the saturation study (17-config grid)
+### Vòng đang chạy
 
-Tuning around ramp60 (strength ×2, σ∈{2,2.5,3,3.5,4}, AREA∈{0.60…0.70},
-sharp-vs-ramp shapes, per-codec splits with encoder-matched configs) maps a
-clean concave landscape: **heuristic smoothing saturates at ≈−3%** (single-seed
-best h264 −3.05% @ σ=3; pushing strength *worsens* BD to +2…+5% because heavy
-blur on a small unprotected region leaves large residuals). The grid is the
-paper's evidence that the next gains must come from *learning* — which the
-D8 entropy model supplies.
+**D10 — họ additive** (`src/models/additive.py`, 9.795 tham số, theo Zhao et al.):
+`x_pre = x + s · to_rgb(fused)`, hai nhánh không-gian/thời-gian trộn bằng cổng
+sigmoid. Đây là cơ chế duy nhất có thể cho gap ≥ 0 — mọi trục *trừ bớt* (blur,
+drop frame, resample) đều đã đóng vì trung hoà R-D (xem dưới).
 
-### D8 — learned factorized-prior rate model (the fix the proofs pointed to)
+Lần chạy đầu **VOID** vì lỗi hiệu chuẩn proxy (xem "Bẫy hạ tầng #1"). Đã sửa ở
+commit `2101bf1`, cổng kiểm tra đã PASS, đang train lại.
 
-`src/models/entropy_codec.py` (`codec.kind=entropy`): the Gaussian-power rate is
-replaced by a **trained Laplacian factorized prior** — per-DCT-position mixture
-(K components: weights/locs/scales as 3 tiny tables) over quantised symbols,
-with its own Adam. Gradient now flows as `-∂log2 p(symbol)/∂s` — alive for any
-symbol the prior assigns mass to, and the prior itself learns which symbols the
-codec actually produces. Running results land in this table as they arrive.
+---
 
-### Where this leaves the contribution ladder (same 3 GB data, same protocol)
+## Cơ chế đã tìm ra: trung hoà R-D
 
-| method | BD-rate h264 / h265 | cost |
+Các biến thể ở trên không thất bại vì những lý do rời rạc. Chúng thất bại vì **một**
+lý do, và nó đo được theo từng QP:
+
+> **Tại đúng độ chính xác mà clip đã tiền xử lý đạt được, anchor trần cũng chỉ cần
+> xấp xỉ số bit đó.**
+
+Hỏi chính đường cong `(độ chính xác → log bpp)` của anchor xem một mức chính xác
+đáng giá bao nhiêu bit, thì mọi khoản tiết kiệm của prefilter đều đúng bằng thứ nó
+đã phá. Một cái blur tiết kiệm 11% bitrate và mất 0.03 độ chính xác, trên đường
+cong của anchor, **không phân biệt được với việc chỉ đơn giản tăng QP**.
+
+Đã xác nhận trên **năm cơ chế độc lập**: blur không gian, cổng saliency, drop frame
+theo thời gian, phân bổ rate không gian (trường QP theo block), và — lần đầu trên
+thứ *không phải* prefilter — **cấu hình phía encoder** (`g224`: `-tune ssim`,
+`psy-rd=0:psy-rdoq=0`). Tắt RDO tâm thị giác tiết kiệm bit *nhiều hơn* dự đoán và
+vẫn trả về BD ≈ 0.
+
+Hai hệ quả phải nói thẳng, vì chúng tốn GPU-giờ mới học được:
+
+- **Đo riêng bitrate không phải bằng chứng có lợi thế.** `lo_s7` tiết kiệm đều
+  −9…−12% ở mọi QP và trả về **+9.28%**, vì đường cong anchor ở QP20 dốc đến mức
+  một gap −0.029 định giá thành +73% bitrate-tương-đương. Ngân sách accuracy để hoà
+  vốn rất nhỏ ở QP thấp và nới ra khi QP tăng.
+- **Sàng lọc 3 clip cục bộ phải được hiệu chuẩn, và hiệu chuẩn không phổ quát.**
+  `r96` cho thấy sàng lọc *lạc quan* 0.60×; `g224` cho thấy nó **bi quan 1.63×**.
+  Khác biệt nằm ở độ bão hoà của anchor, không ở cỡ mẫu.
+
+### Kết quả hình học: tại sao mọi số h265 đều ≈ 0
+
+h265 ra gần 0 ở gần như mọi vòng, và đó không phải codec cứng đầu. Ở 112², h265 chỉ
+trải **×3.38 bitrate trên toàn lưới QP30–50** (h264 trải ×6.19), với bước theo QP
+suy giảm −36.9/−30.0/−22.7/−13.5% — bước giảm đơn điệu là dấu vết của một **sàn
+overhead cố định**. Đoạn QP45→50 gần như dựng đứng trong mặt phẳng rate–accuracy,
+nên tích phân BD trên đó bị điều kiện xấu (ill-conditioned): mọi phần trăm tiết
+kiệm đều đo trên một đường cong hầu như không dịch chuyển.
+
+Ở 224² cùng phép đo cho **×5.02 với h265** (h264 ×6.92) với bước gần như không đổi,
+và độ chính xác QP50 của h265 tăng từ 0.115 lên 0.250. **Vấn đề là hình học, không
+phải lưới QP** — điều này cũng khai tử luôn đề xuất "lưới QP riêng cho từng codec".
+
+### Sổ trục (axis ledger)
+
+| trục | trạng thái | bằng chứng |
 |---|---|---|
-| 5.1 learned (best of 11 variants) | +2.1% / +3.2% | full training |
-| u6 learned + gate (best) | +47.7% / +32.5% | full training |
-| **u6 fixed ramp60 (this repo)** | **−2.0% / −2.3%** | **zero training** |
-| Zhao et al. reproduced @ 3 GB (user-run, 400 videos) | +0.77% / −3.18% | full training |
-| Zhao et al. reported (full Kinetics, A100, per-backbone) | −12.3…−19.6% | per-backbone training |
+| blur không gian / cổng saliency | **đóng** | trung hoà R-D; cả họ đơn điệu theo strength, cực trị là identity tiếp cận từ dưới |
+| drop frame theo thời gian | **đóng** | `tdup6` BD −8.18% nhưng gap −0.176 |
+| phân bổ rate không gian (trường QP theo block) | **đóng** | ở bitrate *khớp nhau*, không gì thắng được việc để encoder tự phân bổ |
+| chroma | **đóng** | bỏ chroma **hoàn toàn** chỉ tiết kiệm 3–6% bitstream |
+| cấu hình encoder theo codec | **đóng** | `g224` BD ≈ 0, gap h264 FAIL |
+| hình học 224 + bỏ octave trên cùng | **đóng** | `g224` / `r96`; analyzer resize về 112 nên octave trên vô hình, nhưng bỏ nó vẫn không thắng |
+| **residual cộng (additive, gap ≥ 0)** | **live** | trục duy nhất còn lại; vòng D10 đang chạy lại |
 
-At matched data scale the zero-training heuristic is **on par with or better
-than the learned baseline** — and unlike it, works zero-shot with any analyzer
-(the saliency mask comes from whichever analyzer will consume the stream, at
-inference time).
+Một kết quả âm trong dòng phân bổ rate đáng giữ lại: **bản đồ saliency có mang
+thông tin thật**. Bảo vệ *nửa sai* số block (cùng số lượng, mask lật ngược) làm mất
+0.32 / 0.24 độ chính xác so với bảo vệ nửa đúng. Nên "mask không có tác dụng" là
+tính chất của *việc blur*, không phải của bản đồ.
 
-> **Superseded.** This ladder is on 207 test clips. On 1159 clips the ramp row measures
-> −3.41% / −0.26% with a clip-level CI, and the family's true effect is ≈0 ± 3%. See
-> [The full-dataset chapter](#the-full-dataset-chapter-1159-clips-2026-08-30--what-survived).
+---
 
-## The full-dataset chapter (1159 clips, 2026-08-30) — what survived
+## Bẫy hạ tầng (đọc trước khi tin bất kỳ con số nào)
 
-Every number above this line was measured on a **3 GB index → 207 test clips**, which is
-why single-seed BD-rate swung ±2%. The attached Kaggle dataset is **35.8 GB**; indexing all
-of it gives **1159 test clips** (test-set fingerprint `30f083f8520a`, asserted identical by
-every shard). Evaluation is sharded across 6 Kaggle GPU slots (3 accounts × 2 batch
-sessions) and merged additively.
+Ba mục dưới đây mỗi cái đã từng huỷ ít nhất một vòng chạy. Chúng ở trong README vì
+đọc lại rẻ hơn tái phát hiện.
 
-Two protocol details that turned out to matter:
+### #1 — Bước lượng tử hoá của proxy tính theo đơn vị [0,1], KHÔNG phải [0,255]
 
-1. **Shard membership and the train/test split are MD5-of-clip-path, not list position.**
-   `build_index` shuffles a list whose order comes from `os.walk`, which is not stable
-   across machines — a positional split would have silently overlapped between shards.
-2. **Each shard dumps per-clip rows** (bpp, top-1 hit, GT probability) as well as the
-   additive accumulators, so the merge bootstraps a **clip-level 95% CI on BD-rate**. That
-   interval, not a 3-seed spread, is the honest error bar for "this method on this test set".
+`VirtualCodec` mã hoá các plane trong **[0,1]**. Với DCT 8×8 trực chuẩn, hệ số DC
+nằm ở `8·mean ≈ 4` và gần như mọi hệ số AC đều < 0.5. Nên `step = 1.0` **xoá sạch
+toàn bộ AC** và đặt giá trị trung bình của block lên lưới `step/8` — khoảng 8 mức
+xám, chỉ còn thấy block. Số mức xám ngụ ý = `1 / (step/8)`.
 
-> ### ⚠️ Correction to everything above
-> At 1159 clips the whole analytic saliency-blur family — **ramp60 / D4.5 included** — sits
-> inside a confidence interval that spans or nearly spans zero. Its true effect is
-> **≈0 ± 3%**, and the D1–D9 *ranking* of variants was fitting noise. The −2.0%/−2.3%
-> headline is not retracted as a measurement; it is retracted as a *result*. Read the table
-> below, not the tables above.
+`configs/additive_ar.yaml` từng ship `step_coarse: 3.0 / step_fine: 1.0` — những
+con số **hợp lý với JPEG trong thang 8-bit** và **thô gấp 255 lần** ở đây. Hệ quả,
+đo tại 128², 16 frame:
 
-### Every variant measured on the full set
+| | QP30 | QP35 | QP40 | QP45 | QP50 |
+|---|---|---|---|---|---|
+| x264 thật | 31.44 | 28.85 | 26.32 | 23.70 | 21.52 dB |
+| x265 thật | 31.14 | 28.48 | 25.81 | 23.26 | 21.00 dB |
+| proxy, step 3.0/1.0 (**hỏng**) | 19.16 | 15.19 | 15.71 | 12.59 | **9.71** dB |
+| proxy, step 0.25/0.03 (**đúng**) | 35.86 | 32.04 | 28.73 | 27.53 | 25.40 dB |
 
-Selection rule ("gap rule"): the per-QP accuracy gap `prep − anchor` must be **≥ −0.05 at
-every QP** on both codecs. A variant that fails it is disqualified regardless of BD-rate.
+Setting **mịn nhất** của proxy hỏng (19.16 dB) còn tệ hơn quality **thô nhất** của
+x264 mà nó phải đại diện (21.52 dB). Nên analyzer ở mức **đoán bừa trên từng frame
+nó từng thấy** trong suốt quá trình train: `L_task` chạy CE 8.484 → 8.038, chưa bao
+giờ xuống dưới `ln(400) = 5.991`, và **76% mức giảm loss là `mu·L_D` fit vào một
+target đã bị phá**. Residual thu được là nhiễu bị MSE nắn theo rác.
 
-| variant | mechanism | h264 BD [95% CI] | h265 BD | gap rule |
-|---|---|---|---|---|
-| `t_base` | ramp blur + static saliency mask (the D4.5 headline) | **−3.41%** [−5.67, −1.24] | −0.26% | PASS (−0.015) |
-| `x_base` | same, mask from a **held-out** analyzer | −2.65% [−4.64, −0.49] | **−1.43%** | PASS (−0.011) |
-| `f_s4` | flat strength s=0.4, no ramp | −1.14% [−3.44, +0.98] | −0.21% | PASS (−0.029) |
-| `t_stat` | ramp + static mask, temporal proxy (918 clips) | −1.90% [−4.39, +0.58] | +1.32% | FAIL (−0.062) |
-| `f_s7` | flat s=0.7 | +2.50% | +3.46% | — |
-| `lo_s7` | flat s=0.7 on a QP20–40 grid | +9.28% [+2.70, +15.06] | +5.62% | FAIL (−0.066) |
-| `r96` | spatial resample round-trip to 96² | +8.54% [+5.57, +11.60] | +8.69% | FAIL (−0.144) |
-| `tdup6` | temporal hold, every 6th frame | **−8.18%** [−11.30, −5.22] | −0.23% | **FAIL (−0.176)** |
-| `g224` | per-codec encoder flags at `frame_size` 224 | −0.65% [−3.81, +2.32] | −0.84% | FAIL (−0.072) |
+Xác nhận trực tiếp: cho identity (`s = 0`, không sửa gì) đi qua chính proxy đó,
+113 clip Kinetics thật, `r2plus1d_18` held-out:
 
-`tdup6` is the largest BD-rate the project has produced and the only one to clear the −8%
-publication target — and it is **disqualified**: a −0.176 gap is 3.5× the rule. Note where
-both `tdup6` and `g224` broke: **QP45**. The gap, not the bitrate, is the binding
-constraint, and it has been the binding constraint in every failure here.
+| | clean | QP30 | QP35 | QP40 | QP45 | QP50 |
+|---|---|---|---|---|---|---|
+| proxy **hỏng**, top-1 | 0.894 | 0.018 | 0.009 | 0.009 | 0.027 | 0.009 |
+| proxy **đã sửa**, top-1 | 0.894 | **0.850** | **0.743** | **0.602** | **0.478** | **0.336** |
+| proxy đã sửa, CE | 0.492 | 0.570 | 1.003 | 1.889 | 2.629 | 3.835 |
 
-### The mechanism: R-D neutrality
+0.009–0.027 trên 400 lớp **chính là mức đoán bừa** (113 clip ⇒ 1 clip = 0.00885).
 
-The variants above do not fail for unrelated reasons. They fail for one reason, and it is
-measurable per QP: **at the accuracy the preprocessed clip actually reaches, the bare anchor
-would have needed about the same number of bits.** Ask the anchor's own
-(accuracy → log bpp) curve what a given accuracy costs it, and every prefilter's saving
-turns out to be worth roughly what it destroyed. A blur that saves 11% of the bitrate and
-loses 0.03 of accuracy is, on the anchor's curve, indistinguishable from simply raising QP.
+**Quy tắc rút ra:** hiệu chuẩn proxy khả vi theo **distortion so với codec thật**,
+**không bao giờ theo bpp**. Chính việc chạy theo bpp "trông thực tế" đã làm step bị
+thô: rate model Gaussian không tham số đếm thiếu bit, và với `beta = 0.001` thì số
+hạng rate chỉ mang tính trang trí — bpp cao hơn x264 5–20× là **đúng và không liên
+quan**. Đo target bằng `u6_big4/proxy_target.py`.
 
-This has now been confirmed on **five independent mechanisms**: spatial blur, saliency
-gating, temporal frame-drop, spatial rate allocation (a per-block QP field), and — for the
-first time on something that is not a prefilter at all — **encoder-side configuration**
-(`g224`: `-tune ssim`, `psy-rd=0:psy-rdoq=0`). Turning off psychovisual RDO saved *more*
-bits than predicted and still returned BD ≈ 0.
+### #2 — Assertion đơn điệu là một lỗ gác, không phải một cái gác
 
-Two consequences worth stating plainly, because they cost GPU-hours to learn:
+Lỗi #1 lọt qua self-check vì assertion duy nhất trên phần hiệu chuẩn là tính đơn
+điệu (`mse[0] > mse[-1]`) — **mà một tấm hình bị phá hoàn toàn vẫn thoả**. Bất kỳ
+assertion chỉ-đơn-điệu trên một núm điều chỉnh độ trung thực đều là lỗ gác.
 
-- **A bitrate-only probe is not evidence of a lead.** `lo_s7` saved a constant −9…−12% at
-  every QP and returned **+9.28%**, because the anchor's curve at QP20 is so steep that a
-  −0.029 accuracy gap prices at +73% bitrate-equivalent. The break-even accuracy budget is
-  brutally small at low QP and grows with QP.
-- **A local 3-clip screen must be calibrated, and the calibration is not universal.** `r96`
-  showed the screen optimistic by 0.60×; `g224` showed it **pessimistic by 1.63×**. The
-  difference is the anchor's saturation, not the sample — at `frame_size` 112 the anchor
-  sits on a fixed-overhead floor that dilutes any saving.
+`virtual_codec._demo()` giờ gác bằng **sàn tuyệt đối**: quality mịn nhất > 24 dB
+(phải thắng quality tệ nhất mà nó đại diện), thô nhất > 15 dB. Chạy
+`python -m src.models.virtual_codec` để kiểm tra.
 
-### The geometry result: why every h265 number was ≈0
+### #3 — STE / forward bằng codec thật đã chết 3 lần, đừng đề xuất lần thứ 4
 
-h265's BD-rate came out near zero in almost every round, and it was not the codec being
-stubborn. At 112², h265 spans only **×3.38 of bitrate across the entire QP30–50 grid**
-(h264 spans ×6.19), with per-QP steps decaying −36.9/−30.0/−22.7/−13.5% — monotonically
-decaying step sizes are the fingerprint of a fixed-overhead floor. The QP45→50 segment is
-near-vertical in the rate–accuracy plane, so a BD integral over it is badly conditioned and
-any percentage saving is measured against a curve that barely moves.
+Cùng một ý tưởng, ba repo, ba lần thất bại. STE sửa **giá trị** mà loss nhìn thấy,
+nhưng backward vẫn là của proxy — nên nó **không sửa hướng gradient**. Hình học
+sai vẫn cho hướng sai. Xem `docs/RUN_DESIGN_additive.md`.
 
-At 224² the same measurement reads **×5.02 for h265** (h264 ×6.92) with near-constant steps,
-and h265's QP50 accuracy rises from 0.115 to 0.250. **The geometry, not the QP grid, was the
-problem** — which also retires the per-codec QP grid that was proposed as a fix.
+### #4 — Cỡ mẫu test
 
-### Axis ledger
+3 GB / 207 clip làm BD-rate trên h264 trải rộng thêm 14–16 điểm phần trăm. **~600
+clip là sàn**; 1159 clip gần như miễn phí so với 600. Mọi bảng xếp hạng giữa các
+biến thể đo trên 207 clip đều là fit nhiễu — đó chính xác là điều đã xảy ra với
+D1–D9.
 
-| axis | status | evidence |
-|---|---|---|
-| spatial blur / saliency gating | **closed** | R-D neutral; family monotone in strength, optimum is the identity approached from below |
-| temporal frame-drop | **closed** | `tdup6` −8.18% BD but gap −0.176 |
-| spatial rate allocation (per-block QP field) | **closed** | at *matched* bitrate nothing beats letting the encoder allocate |
-| chroma | **closed** | discarding chroma **entirely** saves only 3–6% of the bitstream |
-| per-codec encoder configuration | **closed** | `g224` BD ≈ 0, h264 gap FAIL |
-| **224 geometry + top-octave resample** | **live** | the analyzer resizes any input to 112 internally, so the top octave at 224 is analyzer-invisible while the codec still pays for it |
+### #5 — Chia train/test và chia shard theo MD5 của đường dẫn clip, không theo vị trí
 
-One negative result inside the rate-allocation row is worth keeping: the **saliency map does
-carry real information**. Protecting the wrong half of the blocks (same block count, mirrored
-mask) costs 0.32 / 0.24 of accuracy against protecting the right half. So "the mask does no
-work" is a property of *blurring*, not of the map.
+`build_index` shuffle một list mà thứ tự đến từ `os.walk`, thứ này **không ổn định
+giữa các máy**. Chia theo vị trí sẽ âm thầm cho các shard chồng lấn nhau. Mọi shard
+đều assert cùng fingerprint test `30f083f8520a`.
 
-### Where the project actually stands
+---
 
-**No variant meets the publication target** (BD-rate ≤ −8% on *both* codecs with the gap rule
-passed). Measured so far: everything that passes the gap lands in −1…−3.4% with h265 ≈ 0, and
-the one variant that beat −8% failed the gap by 3.5×.
+## Các đóng góp hạ tầng
 
-The live axis is the only one left, and it is the first with bits to spare. Because
-`ActionRecognitionAnalyzer._prep` resizes any input to `clip_size` 112 unconditionally — in
-*both* arms — running the pipeline at `frame_size` 224 means the top spatial octave is
-**invisible to the analyzer but still paid for by the encoder**. Removing it is therefore
-close to free on the accuracy axis by construction, not by luck. A local screen prices a
-resample round-trip to 160² at −28/−20/−13% of the bitrate for a prediction movement of
-−0.022, and a fine sweep puts the damage knee at 128 (everything ≥128 on one plateau).
-
-Priced on the *measured* 224 anchor, the expected BD-rate as a function of the accuracy gap:
-
-| assumed gap | h264 | h265 |
-|---|---|---|
-| 0.00 | −12.8 … −21.4% | −9.6 … −16.2% |
-| −0.02 | −7.0 … −16.3% | −5.1 … −12.2% |
-| −0.03 | −4.2 … −13.8% | −3.0 … −10.3% |
-| −0.05 | **+1.2** … −9.1% | **+0.9** … −6.8% |
-
-(range = local-screen calibration bracketed over 0.6–1.0, for the reason given above)
-
-Which sharpens the success criterion: **a gap of exactly −0.05 is legal under the
-publication rule and still misses the target.** This axis needs the gap to come in at
-**≥ −0.03**, and a PASS at −0.04…−0.05 must be read as a near-miss rather than a win.
-
-> 🇻🇳 **Tóm tắt chương full-dataset.** Toàn bộ số D-series ở trên đo trên 207 clip; ở
-> **1159 clip** cả họ blur/saliency (kể cả ramp60) nằm trong khoảng tin cậy chứa 0 — hiệu
-> ứng thật ≈0 ± 3%, và thứ tự xếp hạng giữa các biến thể là fit nhiễu. Cơ chế đã tìm ra:
-> **trung hoà R-D** — tại độ chính xác mà clip tiền xử lý đạt được, anchor trần cũng chỉ
-> cần xấp xỉ số bit đó, nên mọi khoản tiết kiệm đều đúng bằng thứ đã phá. Đã xác nhận trên
-> 5 cơ chế độc lập, gồm cả cấu hình encoder. **Ràng buộc quyết định là accuracy gap, không
-> phải bitrate** — `tdup6` đạt BD −8.18% (con số lớn nhất dự án từng có) nhưng bị loại vì
-> gap −0.176. Trục duy nhất còn sống là hình học 224: analyzer luôn resize về 112 nên octave
-> không gian trên cùng ở 224 là *vô hình với analyzer nhưng encoder vẫn trả tiền*.
-
-## Why upgrade-3 (what was limiting upgrade-2)
-
-The direct baseline is **Zhao et al., "A Preprocessing Framework for Video Machine
-Vision under Compression," arXiv:2512.15331 (2025)** — a neural preprocessor
-trained through a differentiable *virtual codec* and deployed in front of real
-x264/x265, reporting **> 15 % BD-Rate** savings across action-recognition and
-tracking backbones.
-
-Our `upgrade2` reproduced the *harness* (differentiable proxy, real-codec eval,
-BD-Rate-on-accuracy) and reached a **working but modest** operating point:
-in-domain `prep+compressai` ≈ −2 to −6 % with positive BD-accuracy, but transfer
-to real x264/x265 stalled near break-even. Its own report (`docs/bao_cao_preprocessing.md`)
-diagnosed three ceilings:
-
-| Limitation in upgrade-2 | Fixed in upgrade-3 by |
-|---|---|
-| Trained against **one** frozen analyzer → edit overfits that network | **A1** multi-teacher panel + held-out generalization test |
-| Bit/edit budget spent **uniformly** → cutting background also blurs the object | **A2** task-importance spatial mask |
-| Trained **entirely** through a mismatched proxy → poor transfer to real x26x | **A3** real-codec-in-the-loop calibration + soft→hard quant anneal |
-
-## Why upgrade-5.1 (what was still limiting upgrade-3)
-
-The measured upgrade-3 result (1000-step STE run, seed 0, held-out analyzer):
-`prep+h264 −1.61 %`, `prep+h265 −0.27 %` BD-Rate — transfer turned negative
-but remained an order of magnitude short of the paper's −12…−19 %. Two
-signatures in the rate-accuracy curves motivated the two 5.1 contributions:
-
-| Remaining limitation in upgrade-3 | Fixed in 5.1 by |
-|---|---|
-| Proxy codes **RGB planes**; real codecs code **YCbCr 4:2:0** — chroma is halved at *every* QP and quantised coarser, so the training rate-gradient under-charges chroma-heavy edits and never rewards moving budget to luma | **C1** yuv420 colourspace proxy (`src/models/color.py`, `VirtualCodec(colorspace="yuv420")`) |
-| FiLM conditions extrapolated at heavy QPs (train grid ≠ eval grid; `prep+h265` accuracy *collapsed* at QP50) | **C2** in-grid QP protocol: train exactly on the eval QPs `[30, 35, 40, 45, 50]` |
-
-## The three upgrade-3 contributions
-
-### A1 — Universal, analyzer-agnostic preprocessor (headline)
+### A1 — Bộ tiền xử lý phổ quát, không phụ thuộc analyzer (đóng góp chính)
 `src/tasks/multi_teacher.py`, `src/tasks/base.py::build_analyzer`
 
-Instead of a single frozen analyzer, the preprocessor is trained against a **panel
-of frozen teachers** (`task.teachers`, e.g. `r3d_18` + `mc3_18`). Each step either
-averages the task loss over all teachers (`mean`) or samples one teacher
-(`sample`, a stochastic-multi-teacher regularizer that stops the edit from
-specializing to a single network). Feature distillation follows the *active*
-teacher so it stays coherent within a step.
+Thay vì một analyzer đóng băng duy nhất, bộ tiền xử lý được train trước một **panel
+teacher đóng băng** (`task.teachers`, ví dụ `r3d_18` + `mc3_18`). Mỗi step hoặc lấy
+trung bình task loss trên toàn panel (`mean`), hoặc **lấy mẫu một teacher**
+(`sample` — một cách regularize kiểu stochastic-multi-teacher, ngăn edit chuyên biệt
+hoá vào một mạng). Distillation đặc trưng đi theo teacher *đang hoạt động* để giữ
+nhất quán trong step.
 
-The generalization claim is then measured against a **held-out analyzer that is
-never in the panel** (`eval.held_out_backbone`, e.g. `r2plus1d_18`). Standard-codec
-preprocessing works (Lu et al. 2206.05650) only show *narrow* same-family transfer;
-learned-codec works that do prove broad held-out transfer (**UG-ICM**,
-arXiv:2501.04579; **All-in-One Transfer**, arXiv:2504.12997) retrain the codec.
-"Universal preprocessing proven on a broad held-out analyzer *with the standard
-codec left frozen*" is the open niche this repo targets. Multi-teacher aggregation
-follows multi-teacher distillation (arXiv:2510.18680) and the feature-modulation
-multi-task preprocessor of **Yang et al., TCSVT 2024** (DOI 10.1109/TCSVT.2023.3348995).
+Tuyên bố về tổng quát hoá sau đó được đo trên một **analyzer held-out chưa bao giờ
+có trong panel** (`eval.held_out_backbone`, ví dụ `r2plus1d_18`). Các công trình
+tiền xử lý trước codec chuẩn (Lu et al. arXiv:2206.05650) chỉ cho thấy transfer
+*hẹp* trong cùng họ; các công trình chứng minh được transfer rộng (**UG-ICM**
+arXiv:2501.04579, **All-in-One Transfer** arXiv:2504.12997) đều **train lại codec**.
+"Tiền xử lý phổ quát, chứng minh trên analyzer held-out rộng, *với codec chuẩn giữ
+nguyên đóng băng*" là khe hở mà repo này nhắm tới.
 
-### A2 — Task-importance spatial mask
+### A2 — Bản đồ tầm quan trọng theo không gian
 `src/models/task_mask.py`, `src/losses.py`
 
-A **gradient-saliency** map of the task loss w.r.t. the input, `m = |∂L_task/∂x|`,
-computed with one extra backward through the frozen teacher and then **detached**.
-It *spatially reweights* the edit (`delta`) and total-variation (`gamma`) penalties
-by `1 − m`, so the preprocessor smooths and stops spending bits on **background**
-while sparing the object the machine needs. This is the pixel-domain, differentiable
-analogue of task-driven bit allocation — cf. **Reinforced Bit Allocation**
-(arXiv:1910.07392), **feature-preserving RDO** (arXiv:2504.02216), and **ROI
-retargeting for machines** (EURASIP JIVP 2025, DOI 10.1186/s13640-025-00682-3) —
-but without touching the encoder. It turns upgrade-2's *global* in-domain↔transfer
-knob (`gamma`) into a *spatial* one.
+Bản đồ **gradient-saliency** của task loss theo input, `m = |∂L_task/∂x|`, tính bằng
+một backward phụ qua teacher đóng băng rồi **detach**. Nó *tái phân bổ theo không
+gian* các penalty về edit (`delta`) và total-variation (`gamma`) theo `1 − m`, nên bộ
+tiền xử lý làm mượt và ngừng tiêu bit ở **nền**, chừa lại vật thể mà máy cần. Đây là
+bản tương tự khả vi, ở miền pixel, của phân bổ bit theo task — nhưng không chạm vào
+encoder.
 
-### A3 — Real-codec calibration (proxy → real transfer)
+### A3 — Hiệu chuẩn với codec thật (proxy → thật)
 `src/models/ste_codec.py`, `src/models/virtual_codec.py`
 
-Two mechanisms that close the proxy→real gap that capped upgrade-2's transfer:
+1. **Straight-through codec thật.** `STECodec` chạy x264/x265 *thật* ở forward và
+   vay gradient của proxy khả vi ở backward:
+   `x̂ = x_proxy + (x_real − x_proxy).detach()`, tương tự cho bpp.
+   **Kết quả của repo này: chết 3 lần** — xem Bẫy hạ tầng #3.
+2. **Anneal lượng tử mềm→cứng.** Proxy block-DCT anneal quantiser từ nhiễu đều cộng
+   (mềm) sang straight-through hard rounding (`codec.anneal: 1.0`), để proxy kết thúc
+   ở đúng quantiser cứng của codec thật.
 
-1. **Straight-through real codec.** `STECodec` runs the *real* x264/x265 in the
-   forward pass and borrows the differentiable proxy's gradient in the backward
-   pass: `x̂ = x_proxy + (x_real − x_proxy).detach()`, and likewise for bpp. The
-   loss the optimizer sees is computed on the **true** reconstruction and **true**
-   coded rate. This is the single most reliable transfer recipe in the literature:
-   **Lu et al. (arXiv:2206.05650 / TCSVT 2024)** measured forward-real-codec at
-   −20.3 % BD-Rate vs −14.6 % for a proxy used in both directions. (ffmpeg-per-step
-   is slow → used as a short **calibration fine-tune** on top of a proxy-pretrained
-   checkpoint; see the two-stage recipe below.)
-2. **Soft→hard quantizer annealing.** The block-DCT virtual codec anneals its
-   training quantizer from additive-uniform noise (soft) to straight-through hard
-   rounding (`codec.anneal: 1.0`), so the proxy ends at the codec's real hard
-   quantizer — cf. the soft-quantizer α→∞ schedule of **J4D** (arXiv:2606.16185).
-
-The block-DCT proxy geometry itself (vs a learned wavelet proxy) follows Zhao et al.
-2512.15331 and **Sandwiched Compression** (arXiv:2402.05887); the virtual-codec +
-straight-through idea traces to **DPP** (Chadha & Andreopoulos, CVPR 2021) and the
-differentiable-JPEG proxy of **Talebi et al.** ("Better Compression with Deep
-Pre-Editing," IEEE TIP 2021).
-
-## The two upgrade-5.1 contributions
-
-### C1 — yuv420 colourspace proxy (the colourspace gap STE cannot close)
+### C1 — Proxy trong không gian màu yuv420 (khe hở màu mà STE không đóng được)
 `src/models/color.py`, `src/models/virtual_codec.py`
 
-STE corrects the *value* the loss sees, but the gradient still flows through the
-proxy — wrong geometry still gives a wrong direction. x264/x265 never code RGB:
-they convert to BT.601 YCbCr, subsample chroma 2×2 (**at every QP**, independent
-of rate), and quantise chroma coarser (the H.26x chroma QP offset ≈ +6 QP at
-QP50). An RGB proxy therefore under-charges chroma-heavy edits: the
-preprocessor keeps spending budget on chroma detail the real codec destroys for
-free. The 5.1 virtual codec reproduces the whole geometry —
+x264/x265 **không bao giờ** mã hoá RGB: chúng đổi sang BT.601 YCbCr, hạ mẫu chroma
+2×2 (**ở mọi QP**, độc lập với bitrate), và lượng tử chroma thô hơn (offset QP chroma
+của H.26x ≈ +6 QP ở QP50). Một proxy RGB do đó **tính thiếu giá** cho các edit nặng
+chroma: bộ tiền xử lý cứ tiêu ngân sách vào chi tiết chroma mà codec thật phá miễn
+phí. Proxy 5.1 tái tạo toàn bộ hình học đó dưới dạng op khả vi:
 
 ```
-RGB ─► BT.601 YCbCr ─► chroma 2×2 down ─► per-plane DCT+quant (chroma_step× coarser)
-  ─► chroma upsample ─► YCbCr → RGB
+RGB ─► BT.601 YCbCr ─► hạ mẫu chroma 2×2 ─► DCT+quant theo plane (chroma thô hơn ×2)
+  ─► upsample chroma ─► YCbCr → RGB
 ```
 
-— as differentiable ops, so the training rate/distortion gradients finally
-match the deployment codec's colourspace damage. `colorspace: rgb` keeps the
-legacy path for the ablation table.
+`colorspace: rgb` giữ đường cũ cho bảng ablation.
 
-### C2 — in-grid QP protocol
+### C2 — Protocol QP trong lưới
 `configs/*.yaml` (`train.qp_list = eval.qp_list = [30, 35, 40, 45, 50]`)
 
-The FiLM rate-conditioning is only trained on the QPs it sees; eval QPs outside
-the training grid are extrapolations (the upgrade-3 `prep+h265` accuracy
-*collapse at QP50* is the visible symptom). 5.1 trains on exactly the eval grid
-with five distinct proxy qualities — the paper's own QP range — removing the gap
-at zero cost.
+Điều kiện hoá rate bằng FiLM chỉ được train trên đúng những QP nó thấy; QP eval ngoài
+lưới train là ngoại suy (triệu chứng nhìn thấy được ở upgrade-3: độ chính xác
+`prep+h265` *sụp* ở QP50). 5.1 train đúng trên lưới eval với năm quality proxy phân
+biệt — đóng khe hở này với chi phí bằng 0.
 
 ---
 
-## Repository layout
+## Lịch sử: chuỗi D-series đã dẫn tới đây
+
+> ⚠️ **Toàn bộ số trong mục này đo trên 207 clip và đã bị bảng 1159-clip ở đầu
+> README thay thế.** Giữ lại để biết *cách* đã đi tới kết luận, không phải để trích
+> dẫn. Thứ tự xếp hạng giữa các biến thể ở đây là fit nhiễu.
+
+**Cái gì đã kết thúc upgrade-5.1.** Hai lần chạy 3-seed đầu tiên ra **âm**
+(`prep+h264 +2.1%`, `prep+h265 +3.2%`). Một chiến dịch 11 biến thể trọng số loss sau
+đó vẽ ra toàn bộ không gian khả đạt: biến thể tốt nhất (`distill2`, ω=2) vẫn cho
+QP30-gap −0.213, vẫn hỏng luật −0.05; và **loss chính xác của Zhao không transfer
+sang hạ tầng này** (gap −0.298, BD +87%/+60%). Hai cơ chế được xác lập: (i) task
+cross-entropy **chết về mức đoán bừa** dưới thiệt hại của proxy ở QP nặng, nên phần
+lớn thời gian train *không có gradient bảo toàn độ chính xác*; (ii) không còn tín
+hiệu task sống, các áp lực còn lại lái edit về "rẻ cho codec, không đọc được cho
+analyzer". Mọi cách sửa phía loss đều đã thử và thất bại ⇒ thất bại là **cấu trúc**.
+
+| chặng | làm gì | kết quả |
+|---|---|---|
+| **D1/D2** | cổng saliency cấu trúc `x_pre = x + (1−M)·edit` | cổng chạy đúng như thiết kế (vùng bảo vệ là identity bit-exact, QP30-gap hồi 1/3) nhưng residual U-Net học ra **nhiễu tốn bit**: bitrate x264/x265 thật **tăng ~5%** ở mọi QP |
+| **D3/D3.1/D4** | tham số hoá edit thành blend về blur (`edit_kind=smooth`), 5 cấu hình độc lập kể cả STE | **cả 5 đều học ra đúng identity** (s≈0, BD 0.00%) |
+| **D4.5** | bỏ hẳn việc học: ramp cố định theo QP | **kết quả dương đầu tiên**, BD −1.99%/−2.34%, 9/9 quan sát seed×codec đều âm |
+| **D5–D7** | lưới 17 cấu hình quanh ramp60 | phong cảnh lõm, blur heuristic **bão hoà ở ≈−3%**; đẩy strength mạnh hơn làm BD *xấu đi* +2…+5% |
+| **D8** | thay rate model chết bằng prior factorized có train | mở đường, nhưng bị bảng 1159-clip vượt qua |
+| **D10** | residual **cộng** kiểu Zhao (trục duy nhất còn sống) | lần 1 VOID vì Bẫy #1; đang chạy lại |
+
+**Nguyên nhân gốc của D3/D4** (đọc thẳng từ `VirtualCodec._quant_rate`): rate model
+là công thức Gaussian-power không tham số `R = ½·log2(1 + 12·E[y²])`. Khi nền đã bị
+blur, hệ số DCT rơi xuống dưới bước lượng tử và `∂R/∂s → 0` — **gradient rate chết
+đúng ở nơi làm mượt sẽ có lợi**. Gradient CE luôn sống sau đó đẩy s→0 không ai cản.
+
+**Ghi chú lịch sử đáng giữ:** lần chạy D3 đầu tiên "pass" với −12…−20% bpp — một lỗi
+eval âm thầm nạp trọng số `smooth` vào kiến trúc residual; sửa ở `80724ab`,
+`evaluate()` giờ phục hồi siêu tham số kiến trúc từ config lưu trong mỗi checkpoint.
+Bài học: **soi forward pass trước khi tin những con số đẹp.**
+
+### Bậc thang đóng góp (cùng dữ liệu 3 GB, cùng protocol — đã bị thay thế)
+
+| phương pháp | BD h264 / h265 | chi phí |
+|---|---|---|
+| 5.1 learned (tốt nhất trong 11 biến thể) | +2.1% / +3.2% | train đầy đủ |
+| u6 learned + gate (tốt nhất) | +47.7% / +32.5% | train đầy đủ |
+| u6 ramp60 cố định | −2.0% / −2.3% | **không cần train** |
+| Zhao et al. reproduce @ 3 GB (400 video) | +0.77% / −3.18% | train đầy đủ |
+| Zhao et al. báo cáo (full Kinetics, A100, theo từng backbone) | −12.3…−19.6% | train theo từng backbone |
+
+> Dòng Zhao reproduce (+0.77%/−3.18%) đo trên **n=400, trên teacher `r3d_18` chứ
+> không phải analyzer held-out**, và checkpoint đó **không tái tạo được** (MSE gate
+> không phân biệt được kiến trúc; 144 biến thể decode đều fail). **Không dùng để
+> claim.**
+
+---
+
+## Cấu trúc repo
 
 ```
 src/
   models/
-    preprocessor.py    U-Net + FiLM(rate) + SFT(motion) pixel editor (trained)
-                        + D1/D2 saliency gate (gate, gate_area)
-                        + D3 smooth parameterisation (edit_kind=smooth)
-    entropy_codec.py   D8 learned Laplacian factorized-prior rate model
-    virtual_codec.py   differentiable block-DCT proxy (+ A3 soft→hard anneal)
-    codec.py           CompressAI learned proxy (alternative training codec)
-    ste_codec.py       A3 straight-through real-codec wrapper
-    task_mask.py       A2 gradient-saliency importance map + masked TV
+    preprocessor.py    U-Net + FiLM(rate) + SFT(motion) sửa pixel (được train)
+                        + cổng saliency D1/D2 (gate, gate_area)
+                        + tham số hoá smooth D3 (edit_kind=smooth)
+    additive.py        D10 residual cộng hai nhánh kiểu Zhao (9.795 tham số)
+    virtual_codec.py   proxy block-DCT khả vi (+ anneal mềm→cứng A3, yuv420 C1)
+    entropy_codec.py   D8 rate model Laplacian factorized-prior có train
+    codec.py           proxy học được CompressAI (codec train thay thế)
+    ste_codec.py       A3 wrapper straight-through cho codec thật
+    task_mask.py       A2 bản đồ gradient-saliency + TV có mask
+    color.py           C1 BT.601 RGB↔YCbCr + hạ/nâng mẫu chroma 4:2:0
   tasks/
-    base.py            TaskAnalyzer interface + build_task / build_analyzer
-    multi_teacher.py   A1 frozen-teacher panel
-    action_recognition.py  Kinetics-400 video classifiers (r3d_18/mc3_18/r2plus1d_18)
-    tracking.py, siamfc.py, pytracking_adapter.py  GOT-10k tracking task
-  codecs/standard.py   real x264/x265 via ffmpeg (honest coded bpp)
-  losses.py            L_task + ω·L_distill + β·bpp + τ·L_temp (+ δ,γ masked) (+ μ·L_D)
-  metrics/bd_rate.py   Bjøntegaard BD-Rate/BD-accuracy on the rate–accuracy curve
-  engine.py            train / eval loop, rate conditioning, 6-pipeline BD-Rate
+    base.py            interface TaskAnalyzer + build_task / build_analyzer
+    multi_teacher.py   A1 panel teacher đóng băng
+    action_recognition.py  phân loại video Kinetics-400 (r3d_18/mc3_18/r2plus1d_18)
+    tracking.py, siamfc.py, pytracking_adapter.py  task tracking GOT-10k
+  codecs/standard.py   x264/x265 thật qua ffmpeg (bpp coded trung thực)
+  losses.py            L_task + ω·L_distill + β·bpp + τ·L_temp (+ δ,γ có mask) (+ μ·L_D)
+  metrics/bd_rate.py   BD-Rate/BD-accuracy Bjøntegaard trên đường cong rate–accuracy
+  engine.py            vòng train / eval, điều kiện hoá rate, BD-Rate 6 pipeline
 configs/
-  universal_action_recognition.yaml   A1+A2+A3 headline config (+ D-series keys)
-  action_recognition.yaml, tracking.yaml   single-analyzer baselines
-docs/MODEL.md, docs/IMPROVEMENTS.md, docs/KAGGLE.md
-kaggle/   ready-to-run Kaggle notebook + launcher
-tests/    39 unit tests incl. gate/smooth/entropy self-checks
+  universal_action_recognition.yaml   config chính A1+A2+A3 (+ khoá D-series)
+  additive_ar.yaml                   vòng D10 additive (ĐỌC comment về step!)
+  action_recognition.yaml, tracking.yaml   baseline một analyzer
+docs/
+  RUN_DESIGN_additive.md   thiết kế + pre-registration + §5.2 quy nguyên nhân D10
+  MODEL.md, IMPROVEMENTS.md, KAGGLE.md
+kaggle/   notebook Kaggle chạy ngay + launcher
+tests/    39 unit test, gồm self-check gate/smooth/entropy
 ```
 
-Every non-trivial module has a `__main__` self-check (`python -m src.models.virtual_codec`,
-`python -m src.tasks.multi_teacher`, `python -m src.models.task_mask`,
-`python -m src.models.ste_codec`, `python -m src.metrics.bd_rate`).
+Mọi module không tầm thường đều có self-check `__main__`:
+
+```bash
+python -m src.models.virtual_codec    # gồm cả cái gác PSNR tuyệt đối (Bẫy #2)
+python -m src.models.additive
+python -m src.tasks.multi_teacher
+python -m src.models.task_mask
+python -m src.metrics.bd_rate
+```
 
 ---
 
-## Quickstart
+## Chạy thử
 
-### Kaggle one-shot
+### Một phát trên Kaggle
 
-Attach `rohanmallick/kinetics-train-5per`, enable GPU + Internet, then run one cell:
+Attach `rohanmallick/kinetics-train-5per`, bật GPU + Internet, chạy một cell:
 
 ```bash
 %%bash
 set -euo pipefail
 cd /kaggle/working
-if [ -d pre_processing_upgrade_3/.git ]; then
-  git -C pre_processing_upgrade_3 pull --ff-only
+if [ -d preprocessing_upgrade_6/.git ]; then
+  git -C preprocessing_upgrade_6 pull --ff-only
 else
-  git clone -q https://github.com/wagur1/pre_processing_upgrade_3.git
+  git clone -q https://github.com/wagur1/preprocessing_upgrade_6.git
 fi
-cd pre_processing_upgrade_3
+cd preprocessing_upgrade_6
 bash kaggle/run.sh
 ```
 
-`kaggle/run.sh` detects the mounted Kinetics directory and rebuilds legacy indexes
-that do not contain the independent `test` split.
+`kaggle/run.sh` tự phát hiện thư mục Kinetics đã mount và dựng lại các index cũ
+không chứa split `test` độc lập.
 
-### Manual run
+### Chạy tay
 
 ```bash
-pip install -r requirements.txt          # torch, torchvision, compressai, opencv, ffmpeg on PATH
+pip install -r requirements.txt    # torch, torchvision, compressai, opencv, ffmpeg trên PATH
 
-# 1) build a data index (see docs/KAGGLE.md for Kinetics / GOT-10k prep)
-python -m src.data.prepare_3gb   --help
-python -m src.data.prepare_got10k --help
+# 1) dựng index dữ liệu (chia theo MD5 — xem Bẫy #5)
+python scripts/build_train_index.py --help
 
-# 2a) STAGE 1 — proxy pretrain (fast, differentiable block-DCT proxy)
-python train.py --config configs/universal_action_recognition.yaml \
-    data.index=data/index/kinetics_3gb.json train.epochs=5
+# 2) train qua proxy khả vi
+python train.py --config configs/additive_ar.yaml
 
-# 2b) STAGE 2 — real-codec calibration fine-tune (A3; short, ffmpeg-in-the-loop)
-python train.py --config configs/universal_action_recognition.yaml \
-    data.index=data/index/kinetics_3gb.json \
-    codec.kind=ste codec.ste_codec=h265 train.finetune=true train.resume=false \
-    train.epochs=6 train.lr=3e-5           # a few hundred extra steps
-
-# 3) evaluate on a HELD-OUT analyzer, real x264/x265 anchors, BD-Rate
-python evaluate.py --config configs/universal_action_recognition.yaml \
-    --ckpt outputs/checkpoints/preprocessor.pth \
-    data.index=data/index/kinetics_3gb.json eval.split=test eval.held_out_backbone=r2plus1d_18
+# 3) eval trên analyzer HELD-OUT, anchor x264/x265 thật, BD-Rate
+python evaluate.py --config configs/additive_ar.yaml \
+    --ckpt outputs/additive_ar/checkpoints/preprocessor.pth \
+    eval.split=test eval.held_out_backbone=r2plus1d_18
 ```
 
-The preprocessor checkpoint stores **only** the preprocessor weights, so it is
-codec-agnostic: evaluate the same checkpoint against any codec by changing
-`codec.kind` / the anchor list. Outputs (`results.json`, `curves.csv`,
-`rate_accuracy.png`, `qualitative.png`) land in `outputs/eval/`.
+Checkpoint chỉ lưu **trọng số bộ tiền xử lý**, nên nó độc lập với codec: eval cùng
+một checkpoint trên codec khác bằng cách đổi `codec.kind` / danh sách anchor. Kết quả
+(`results.json`, `curves.csv`, `rate_accuracy.png`, `qualitative.png`) nằm ở
+`outputs/eval/`.
 
-With `eval.per_sequence: true` (the default action-recognition setting), the
-evaluator also writes `sequence_points.csv`, `sequence_bd_rate.csv`, and
-`sequence_bd_rate.json`. These contain the five QP points and same-codec
-`prep+h264 vs h264` / `prep+h265 vs h265` BD-Rate for each held-out video.
-Per-video `top1` is retained as a binary diagnostic; because a binary value
-does not provide a useful five-point curve for most individual videos, the
-per-sequence BD fit uses `target_prob`, the frozen analyzer's probability for
-the ground-truth class. The aggregate headline remains BD-Rate on dataset
-top-1 accuracy.
+Với `eval.per_sequence: true` (mặc định cho action recognition), evaluator còn ghi
+`sequence_points.csv`, `sequence_bd_rate.csv`, `sequence_bd_rate.json` — năm điểm QP
+và BD-Rate cùng-codec cho từng video held-out. `top1` theo video được giữ làm chẩn
+đoán nhị phân; vì một giá trị nhị phân không dựng được đường cong 5 điểm hữu ích cho
+phần lớn video đơn lẻ, phần fit BD theo sequence dùng `target_prob` — xác suất mà
+analyzer đóng băng gán cho lớp ground-truth. Con số headline vẫn là BD-Rate trên
+top-1 toàn tập.
 
 ---
 
-## Evaluation protocol & metric
+## Protocol đánh giá & metric
 
-`src/metrics/bd_rate.py` computes **BD-Rate with machine accuracy as the quality
-axis** (top-1 for recognition, success-plot AUC for tracking) instead of PSNR,
-integrating `log(rate)` over the overlapping accuracy range (Bjøntegaard). By
-default, evaluation traces `prep+{x264,x265}` vs bare `{x264,x265}` and reports:
+`src/metrics/bd_rate.py` tính **BD-Rate với độ chính xác của máy làm trục chất
+lượng** (top-1 cho recognition, AUC success-plot cho tracking) thay cho PSNR, tích
+phân `log(rate)` trên vùng độ chính xác chồng lấn (Bjøntegaard). Mặc định, eval vẽ
+`prep+{x264,x265}` so với `{x264,x265}` trần và báo:
 
-* **`bd_prep_gain`** — same-codec preprocessor gain (`prep+x265 vs x265`, …). **The real claim.**
-* `bd_vs_anchor` — cross-codec (reference only; QP not comparable across codecs).
+* **`bd_prep_gain`** — độ lợi cùng-codec (`prep+x265 vs x265`, …). **Đây là claim thật.**
+* `bd_vs_anchor` — chéo codec (chỉ tham chiếu; QP không so được giữa hai codec).
 
-Set `eval.include_proxy=true` to add virtual/CompressAI diagnostic curves.
+BD-Rate âm = ít bit hơn ở cùng độ chính xác.
 
-Negative BD-Rate = fewer bits at equal accuracy. See [`docs/MODEL.md`](docs/MODEL.md)
-for the full architecture and [`docs/IMPROVEMENTS.md`](docs/IMPROVEMENTS.md) for the
-line-by-line delta vs the baseline and upgrade-2.
+**Ba điều kiện để một con số được coi là hợp lệ trong repo này:**
+
+1. Đo trên **test set chuẩn**: 1159 clip, fingerprint `30f083f8520a`, không bao giờ
+   chạm tới lúc train.
+2. Đo trên **analyzer held-out** (`r2plus1d_18`), không phải teacher.
+3. **Luật gap PASS**: `prep − anchor ≥ −0.05` ở mọi QP, trên cả hai codec.
+
+Thiếu bất kỳ điều nào thì con số là chẩn đoán, không phải kết quả.
 
 ---
 
-## Datasets
+## Dữ liệu
 
-* **Kinetics-400** (Kay et al., 2017) — action recognition; frozen torchvision
-  video ResNets carry the canonical 400-class ordering.
-* **GOT-10k** (Huang et al., TPAMI 2021) — single-object tracking; success-plot
-  AUC / AO / SR. Default tracker is a self-contained SiamFC; the paper's exact
-  KYS/DiMP/ATOM/PrDiMP run via `pytracking` (`scripts/install_pytracking.sh`).
+* **Kinetics-400** (Kay et al., 2017) — action recognition; các video ResNet đóng
+  băng của torchvision giữ đúng thứ tự 400 lớp chuẩn. Dataset Kaggle
+  `rohanmallick/kinetics-train-5per` (35.8 GB) → 8636 train / 1010 val / 1159 test.
+* **GOT-10k** (Huang et al., TPAMI 2021) — tracking một vật thể; AUC success-plot /
+  AO / SR. Tracker mặc định là SiamFC tự chứa; KYS/DiMP/ATOM/PrDiMP đúng như bài báo
+  chạy qua `pytracking` (`scripts/install_pytracking.sh`).
 
-## Reproducibility notes
+## Ghi chú về tái lập
 
-* This repo is a **research harness**, not a set of frozen numbers. BD-Rate on a
-  small Kinetics subset fluctuates ±3–4 % per seed — run 3–5 seeds and report a CI
-  (`kaggle/report_ci.py`). Effect size and significance grow with data, not with
-  architecture; A1/A2/A3 raise the *ceiling* and *robustness*, seeds establish
-  *significance*.
-* ffmpeg with `libx264` + `libx265` must be on `PATH` for the real-codec anchors
-  and for the A3 STE stage (preinstalled on Kaggle).
+* Repo này là **hạ tầng nghiên cứu**, không phải một bộ số đã đóng băng.
+* ffmpeg có `libx264` + `libx265` phải nằm trên `PATH` cho các anchor codec thật
+  (Kaggle đã cài sẵn).
+* BD-rate trên tập nhỏ dao động ±3–4% mỗi seed. Ở 1159 clip, hãy báo **CI ở mức
+  clip** bằng bootstrap trên các dòng per-clip (`kaggle/report_ci.py`), *không* dùng
+  độ tản của 3 seed — CI clip-level là thanh sai số trung thực cho "phương pháp này
+  trên tập test này".
+* Mỗi shard eval ghi cả dòng per-clip (bpp, hit top-1, xác suất GT) và các bộ tích
+  luỹ cộng dồn, nên phần merge dựng được CI 95%.
 
-## Experiment tracking (Comet ML)
+## Theo dõi thí nghiệm (Comet ML)
 
-Optional, environment-driven, zero behaviour change when off. `train.py` and
-`evaluate.py` push live loss curves, per-epoch validation, and the final
-BD metrics to a [Comet](https://comet.com) dashboard whenever these variables
-are set (`src/tracking.py`):
+Tuỳ chọn, điều khiển bằng biến môi trường, không đổi hành vi khi tắt.
 
-| Variable | Default | Meaning |
+| Biến | Mặc định | Ý nghĩa |
 |---|---|---|
-| `COMET_API_KEY` | — | **presence enables tracking**; absent → silent no-op |
-| `COMET_PROJECT_NAME` | `vcm-preprocessing` | project on Comet |
-| `COMET_WORKSPACE` | account default | workspace on Comet |
-| `COMET_EXPERIMENT_NAME` | derived from `out_dir` (e.g. `sweep_51-seed_0-mu3`) | experiment name |
+| `COMET_API_KEY` | — | **có mặt là bật tracking**; không có → no-op im lặng |
+| `COMET_PROJECT_NAME` | `vcm-preprocessing` | project trên Comet |
+| `COMET_WORKSPACE` | mặc định của account | workspace |
+| `COMET_EXPERIMENT_NAME` | suy ra từ `out_dir` | tên thí nghiệm |
 | `COMET_MODE` | `online` | `offline` / `disabled` |
 
-`train` writes its experiment key to `<out_dir>/comet_key.txt`, so the later
-`evaluate` run **attaches its BD numbers to the same experiment** instead of
-spawning a new one. On Kaggle, store the key as a notebook secret
-(Add-ons → Secrets, label `COMET_API_KEY`) and `pip install comet_ml`.
+`train` ghi experiment key vào `<out_dir>/comet_key.txt` để lần `evaluate` sau
+**gắn số BD vào cùng thí nghiệm** thay vì sinh cái mới.
 
-## Citations
+---
 
-Full BibTeX-style reference list in [`docs/IMPROVEMENTS.md`](docs/IMPROVEMENTS.md#references).
-Key sources: Zhao et al. arXiv:2512.15331 (baseline); Lu et al. arXiv:2206.05650 /
-TCSVT 2024 (A3 recipe, analyzer-agnostic motivation); Yang et al. TCSVT 2024
-(feature-modulation multi-task preprocessor); FiLM (Perez et al. 2018); SFT (Wang
-et al. CVPR 2018); DPP (Chadha & Andreopoulos CVPR 2021); Talebi et al. TIP 2021;
-J4D arXiv:2606.16185; UG-ICM arXiv:2501.04579; multi-teacher distillation
-arXiv:2510.18680; task-driven bit allocation arXiv:1910.07392 & arXiv:2504.02216.
+## Những việc KHÔNG làm nữa
+
+Danh sách này tồn tại vì mỗi dòng đã tốn GPU-giờ để đóng lại.
+
+- Lần thứ 4 với STE / forward bằng codec thật trên họ *trừ bớt* (Bẫy #3).
+- Định giá bất kỳ vòng nào trên một checkpoint không tái tạo được (`best.pt` cũ).
+- "Sửa" bpp của proxy bằng cách làm thô step lượng tử (Bẫy #1 — đúng là sai lầm đã
+  huỷ D10).
+- Assertion chỉ-đơn-điệu trên núm độ trung thực (Bẫy #2).
+- Lưới QP riêng cho từng codec, nhánh QP thấp, thêm cỡ resample, `r144` — hình học
+  ở 224 đã trả lời hết.
+- Phân bổ rate / trường QP, `tstack`, bỏ chroma — đã đóng.
+- Chọn metric cho vừa kết quả; đọc kết luận từ một shard merge chưa xong.
+- Mở rộng lưới strength xuống dưới khi gap đơn điệu âm — scale nhiễu về 0 chỉ trả về
+  identity, không tạo ra tín hiệu.
+
+## Trích dẫn
+
+Danh sách tham khảo đầy đủ ở [`docs/IMPROVEMENTS.md`](docs/IMPROVEMENTS.md#references).
+Nguồn chính: Zhao et al. arXiv:2512.15331 (baseline); Lu et al. arXiv:2206.05650 /
+TCSVT 2024 (công thức A3, động lực analyzer-agnostic); Yang et al. TCSVT 2024
+(tiền xử lý đa nhiệm điều biến đặc trưng); FiLM (Perez et al. 2018); SFT (Wang et al.
+CVPR 2018); DPP (Chadha & Andreopoulos CVPR 2021); Talebi et al. TIP 2021;
+J4D arXiv:2606.16185; UG-ICM arXiv:2501.04579; distillation đa teacher
+arXiv:2510.18680; phân bổ bit theo task arXiv:1910.07392 & arXiv:2504.02216;
+Sandwiched Compression arXiv:2402.05887.
