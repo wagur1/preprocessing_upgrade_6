@@ -88,6 +88,48 @@ sửa: top-1 0.009→0.336–0.850) và demo `virtual_codec`, **không phải**
 gap dương thật ở QP45/50 nhưng BD dương ở 12/12 arm — xem
 `Desktop/vcm-additive-2026-08-31.txt`.
 
+Ba kết luận của vòng này, vì chúng đổi cách đọc cả dự án:
+
+**(1) Phép biên tập thua chính núm QP của encoder.** BD-rate thực chất chỉ hỏi
+một câu: bộ tiền xử lý mua accuracy có rẻ hơn cách đơn giản là hạ QP không? Đo
+accuracy trên mỗi %bit (`u6_big4/accperbit.py`, cùng 113 clip screen): phép biên
+tập thắng núm QP ở **1/10 ô** duy nhất (h265 QP50, 1.33×, mà ở đó accuracy chỉ
+0.07→0.22 — task đã vỡ). Ở h264 QP45 nó **kém núm 1.26×**; ở h264 QP30 nó **âm**
+(−0.00061 so với +0.00181 của núm) — trả +73% bit để *mất* accuracy. Đây là cách
+phát biểu mạnh nhất của kết quả âm: trung hoà R-D viết thành một tỉ giá
+núm-vs-biên-tập trực tiếp.
+
+**(2) Accuracy KHÔNG còn là điểm nghẽn — chi phí bit mới là.** Giữ accuracy đo
+được cố định rồi ép chi phí bit về k lần mức thật (`u6_big4/ceiling.py`): phần
+lợi model **đã** đạt định giá **−19.76% h264 / −10.49% h265** nếu residual miễn
+phí. h264 vượt xa mốc −11% cần để chứng nhận −8%. Nhưng trần h265 là −10.49%
+**ngay cả ở chi phí bằng 0**, nên mục tiêu "−8% trên *cả hai* codec" là
+**bất khả thi về số học** ở mức accuracy hiện tại (h265 thực tế: −3…−5%). Đây là
+phát biểu mạnh hơn "chưa biến thể nào đạt mục tiêu" ở đầu file — nó đổi cả cuộc
+thảo luận về mục tiêu công bố.
+
+**(3) Protocol đảo dấu, và điều đó giải thích literature.** Cùng screen, sửa
+**một dòng** config (`eval.held_out_backbone: r2plus1d_18` → teacher `r3d_18`):
+BD h264 ở s nhỏ **đảo sang âm** (−5.40 / −7.60 / −1.88% tại s=0.02/0.05/0.10, so
+với +4.22 / +5.36 / +0.57% khi held-out). Cơ chế: phân bố gap theo QP đảo —
+teacher 8/10 ô không-âm vs held-out 3/10 — tức analyzer overfit đậu đúng vào vùng
+bit rẻ. **Suy ra: con số −12.3…−19.6% của Zhao là số *theo từng backbone*
+(on-teacher); thước của repo này (cả hai codec, analyzer held-out) NGHIÊM HƠN
+chính claim của literature.** Cảnh báo giữ nguyên: **không được trích −7.60%** —
+n=113, không đơn điệu theo s, boot5% dứt khoát ở 1/5 ô; phát hiện là **việc đảo
+dấu có hệ thống**, không phải độ lớn.
+
+Hướng thật sự còn mở **không phải** "chạy lại D10" mà là **objective biết đến chi
+phí bit**: `configs/additive_ar.yaml` ship `gamma: 0.0` (TV) và `delta: 0.0`, với
+`beta: 0.001` mà chính comment gọi là decorative — model **chưa bao giờ** được
+yêu cầu tạo residual *rẻ*, trong khi `edit_size.py` đo TV tăng **1.39×**. Núm cần
+xoay là `gamma` (TV), **không phải `omega`** (`omega` là feature distillation —
+`src/losses.py:3-4` là nguồn đúng về tên các hạng); và `gamma` chứ không phải
+`beta`, vì `src/losses.py:32-38` gọi TV là "the lever for transfer to x264/x265
+(unlike `beta*bpp`, which only reduces the *proxy* codec's bits)" và bpp của proxy
+không đáng tin làm mục tiêu tối ưu (Bẫy #1). Rủi ro phải nói trước: phần lợi
+accuracy có thể **chính là** phần tần số cao, hạ TV thì mất luôn.
+
 ---
 
 ## Cơ chế đã tìm ra: trung hoà R-D
@@ -248,6 +290,13 @@ arXiv:2501.04579, **All-in-One Transfer** arXiv:2504.12997) đều **train lại
 "Tiền xử lý phổ quát, chứng minh trên analyzer held-out rộng, *với codec chuẩn giữ
 nguyên đóng băng*" là khe hở mà repo này nhắm tới.
 
+**Giới hạn đo được của chính A1, phải đọc kèm:** panel teacher **không** ngăn được
+chuyên biệt hoá ở quy mô này. Vòng D10 chạy panel 2 teacher, vậy mà phân bố gap
+theo QP ở s nhỏ vẫn **đảo dấu có hệ thống** giữa teacher và held-out (8/10 vs 3/10
+ô không-âm, xem "Vòng mới nhất" điểm 3). Nên A1 hiện là **một cách đặt vấn đề kèm
+phép đo cho thấy nó chỉ transfer một phần**, chưa phải một đóng góp đã chứng minh.
+Đó chính là lý do mọi con số trong file này đều báo song song hai protocol.
+
 ### A2 — Bản đồ tầm quan trọng theo không gian
 `src/models/task_mask.py`, `src/losses.py`
 
@@ -376,17 +425,21 @@ configs/
   additive_ar.yaml                   vòng D10 additive (ĐỌC comment về step!)
   action_recognition.yaml, tracking.yaml   baseline một analyzer
 docs/
-  RUN_DESIGN_additive.md   thiết kế + pre-registration + §5.2 quy nguyên nhân D10
+  RUN_DESIGN_additive.md   thiết kế + pre-registration + §5.2 quy nguyên nhân D10 + §5.3 kết quả chạy lại
+  bao_cao_preprocessing.md báo cáo tiếng Việt của vòng trước
   MODEL.md, IMPROVEMENTS.md, KAGGLE.md
 kaggle/   notebook Kaggle chạy ngay + launcher
 tests/    45 unit test, gồm self-check gate/smooth/entropy/additive
 ```
 
-Mọi module không tầm thường đều có self-check `__main__`:
+Phần lớn module không tầm thường có self-check `__main__` (8 module: `virtual_codec`,
+`ste_codec`, `task_mask`, `color`, `bd_rate`, `multi_teacher`, `prepare_3gb`,
+`prepare_got10k`). `additive.py` **không** có — check của nó nằm ở
+`tests/test_additive.py` (pytest-collectable, 7 test):
 
 ```bash
 python -m src.models.virtual_codec    # gồm cả cái gác PSNR tuyệt đối (Bẫy #2)
-python -m src.models.additive
+python -X utf8 tests/test_additive.py  # additive: 9.795 tham số, identity lúc init, đại số strength
 python -m src.tasks.multi_teacher
 python -m src.models.task_mask
 python -m src.metrics.bd_rate
