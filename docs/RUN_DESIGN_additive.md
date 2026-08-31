@@ -314,12 +314,57 @@ structure, the priciest thing for a DCT codec. `src/losses.py:32-38` already nam
 bits)" -- and `beta` is the wrong knob here anyway, since the proxy is calibrated on PSNR and its
 bpp is not trustworthy as an optimisation target (Trap #1).
 
-**In flight:** a 3-point `gamma` sweep (0.01 / 0.03 / 0.1; 0.03 is `robust_transfer.yaml:49`'s
-"transfer-oriented setting from the repo ablation") at commit `0399f53`, one variable, three
-accounts in parallel. Thresholds were pre-registered before the data existed -- see
-`Desktop/vcm-additive-2026-08-31.txt` §13. Note that even a full PASS there lands at k~0.5
-(-3.82%), so it tests whether the accuracy/cost trade *exists*; it does not by itself reach the
-target.
+## 5.4 The `gamma` sweep was a NULL, and `gamma_res` is the corrected term
+
+A 3-point `gamma` sweep (0.01 / 0.03 / 0.1) ran at commit `0399f53`, one variable, three
+accounts in parallel. All three trained cleanly -- fingerprint OK, val_loss 3.10 -> 1.31
+monotone, best epoch 5, ~2h35m each -- and returned checkpoints **indistinguishable from the
+`gamma: 0` baseline**:
+
+| gamma | residual RMS @s=1.0 | PSNR | clipped | TV ratio |
+|---|---|---|---|---|
+| 0.0 (baseline) | 0.1253 | 18.0 dB | 23.0% | 1.39 |
+| 0.01 | 0.1246 | 18.1 dB | 22.8% | 1.38 |
+| 0.03 | 0.1247 | 18.1 dB | 22.9% | 1.39 |
+| 0.1 | 0.1237 | 18.2 dB | 22.6% | 1.38 |
+
+A 10x change in the coefficient moved the residual by 0.7% RMS; the in-training readout agrees
+(final TV 0.1286 / 0.1288 / 0.1281). **The screens were not run** -- three checkpoints
+indistinguishable from the baseline would have spent 2 more GPU-hours reproducing a known
+result. Verified locally at zero cost with `u6_big4/edit_size.py`.
+
+Two causes, both checkable in minutes before launching:
+
+1. **Magnitude.** `gamma * TV(x_pre)` was 0.00-0.04% of the objective (TV ~ 6e-3 against
+   `L_task` ~ 3.3) -- decorative in exactly the way this repo already documents `beta: 0.001`
+   to be. A biting coefficient is ~10, i.e. 100-1000x what was run. The 0.03 was carried from
+   `configs/robust_transfer.yaml`, where the mechanism is *subtractive blur* and the filter
+   moves `TV(x_pre)` a great deal -- meaningful there, meaningless here.
+2. **Target.** For an additive model `TV(x_pre)` is dominated by the SOURCE video's own
+   texture, so most of the penalty lands on content the preprocessor never created, and
+   minimising it means blurring the source -- rebuilding the subtractive family that §"R-D
+   neutrality" already measures as neutral.
+
+**Corrected term (commit `acbe7be`): `gamma_res * TV(x_pre - x)`.** It penalises only the
+spectrum of what the model ADDS -- what makes an additive edit expensive on a DCT codec -- and
+leaves the source alone. This is the term §5.3's ceiling actually calls for: a residual that is
+CHEAPER AT THE SAME AMPLITUDE, hence the same accuracy. Amplitude is already controlled by
+`delta` and by the strength grid, and an L1 penalty cannot distinguish spectra at all.
+
+`tests/test_residual_tv.py` pins the distinguishing properties and the sizing lesson: the same
+residual on a flat and on a textured source gives an identical penalty (while `TV(x_pre)` moves
+>3x); at equal residual RMS a checkerboard costs >20x a smooth ramp while L1 cannot tell them
+apart; and 0.03 is asserted decorative so it cannot be copied back in.
+
+**In flight:** `gamma_res` at 10 / 30 / 100 -- sized to 1.9% / 5.6% / 18.5% of the task term
+rather than transplanted. Thresholds pre-registered in `Desktop/vcm-additive-2026-08-31.txt`
+§13 before the data existed. Even a full PASS lands at k~0.5 (-3.82%), so this tests whether
+the accuracy/cost trade *exists*; it does not by itself reach the target, and §5.3's h265
+ceiling of -10.49% at zero cost is unaffected by it.
+
+**Rule for the next person adding a loss term:** compute `coefficient * term / L_task` on one
+batch first. Below ~1% of the objective the run returns the baseline. A clean training curve is
+not evidence the term did anything -- read the checkpoint, not the loss log.
 
 ## 6. Outcome interpretations (decided in advance)
 

@@ -48,11 +48,19 @@ Machines), đặt trước một codec chuẩn *đóng băng* (x264 / x265).**
 >    literature's own claim**. (The magnitude of the flip is not quotable: n=113,
 >    non-monotone in strength. The systematic sign reversal is the finding.)
 >
-> **In flight:** a 3-point sweep of the objective's TV penalty (`loss.gamma`,
-> which had always been 0.0 — the objective never asked for a *cheap* residual).
-> Thresholds were pre-registered before the data existed. Even a full pass there
-> lands near −3.8%, so it tests whether the accuracy/cost trade exists at all; it
-> does not reach the target.
+> **Latest:** the objective had never contained a real bit-cost term, so a sweep
+> of the TV penalty `loss.gamma` (0.01/0.03/0.1) was run — and came back a **null**:
+> all three checkpoints landed within 0.7% residual RMS of the `gamma=0` baseline.
+> Cause, measured: `gamma*TV(x_pre)` was 0.00–0.04% of the objective (TV ≈ 6e-3 vs
+> `L_task` ≈ 3.3), i.e. decorative, and the coefficient had been carried over from a
+> config written for a *subtractive* mechanism. `TV(x_pre)` is also the wrong target
+> for an additive edit: it is dominated by the source video's own texture, and
+> minimising it means blurring the source — the family already measured neutral.
+> Replaced by `gamma_res * TV(x_pre − x)`, which penalises only the spectrum of what
+> the model **adds** (`src/losses.py`, `tests/test_residual_tv.py`), swept at
+> coefficients sized against the task term. Thresholds were pre-registered before
+> the data existed; note that even a full pass lands near −3.8%, so it tests whether
+> the accuracy/cost trade exists at all — it does not reach the target.
 >
 > **Reproduction:** canonical split fingerprint `30f083f8520a` (train 8636 / val
 > 1010 / test 1159, `rohanmallick/kinetics-train-5per`), real x264/x265 via
