@@ -47,8 +47,19 @@ codec:                    # differentiable TRAINING proxy (distortion channel)
   inter: true             # closed-loop P-frame prediction
   colorspace: yuv420      # C1: match -pix_fmt yuv420p
   chroma_step_scale: 2.0
-  step_coarse: 3.0
-  step_fine: 1.0
+  # STEPS ARE IN [0,1] PIXEL UNITS, NOT [0,255]. The D10 round shipped
+  # 3.0/1.0 -- JPEG-plausible numbers in 8-bit units, 255x too coarse here --
+  # and its whole 5-quality grid ran at 9.7-19.2 dB PSNR against real x264's
+  # 31.4-21.5 dB over QP30..50 (u6_big4/proxy_target.py). The proxy's FINEST
+  # setting was worse than x264's WORST, so the analyzer was at chance on every
+  # frame it ever saw and L_task never carried a gradient (task CE 8.48 -> 8.04,
+  # never below ln(400)=5.99). These values measure +2.4..+4.4 dB vs real x264
+  # at the mapped QP -- the distortion channel the objective actually needs.
+  # bpp lands 5-20x above x264, which is fine and deliberate: beta=0.001 makes
+  # the rate term decorative (see the header). Do NOT "fix" bpp by coarsening
+  # the step -- that is exactly the mistake that voided D10.
+  step_coarse: 0.25
+  step_fine: 0.03
   anneal: 1.0             # A3: soft->hard quantiser anneal
 
 data:

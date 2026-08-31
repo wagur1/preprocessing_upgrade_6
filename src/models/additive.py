@@ -59,6 +59,15 @@ class AdditivePreprocessor(nn.Module):
         self.fusion.gate = nn.Sequential(
             nn.Conv2d(32, 16, 1), nn.ReLU(), nn.Conv2d(16, 16, 1))
         self.to_rgb = nn.Conv2d(16, 3, 3, padding=1)
+        # Zero-init the output projection so the untrained model IS the identity
+        # (out = x + 0). Default PyTorch init starts the residual at RMS
+        # 0.10-0.18 (15-20 dB from identity, measured over seeds 0/1/2 with
+        # u6_big4/edit_size.py), i.e. the optimiser opens from a random repaint
+        # and has to walk back to identity before it can learn anything useful.
+        # Standard residual-adapter practice; keys/shapes are unchanged, so
+        # best.pt still loads with strict=True.
+        nn.init.zeros_(self.to_rgb.weight)
+        nn.init.zeros_(self.to_rgb.bias)
 
     def forward(self, x: torch.Tensor, cond: torch.Tensor | None = None,
                 mask: torch.Tensor | None = None) -> torch.Tensor:

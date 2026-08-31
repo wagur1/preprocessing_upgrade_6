@@ -295,7 +295,7 @@ def _demo() -> None:
     assert (gq - grey).abs().mean() < 0.05, "achromatic fine-step should reconstruct"
     # Headline Kaggle calibration must also improve distortion as rate rises.
     calibrated = VirtualCodec(
-        qualities=(1, 2, 3, 5, 8), block=8, step_coarse=3.0, step_fine=1.0
+        qualities=(1, 2, 3, 5, 8), block=8, step_coarse=0.25, step_fine=0.03
     )
     smooth = F.avg_pool3d(x, kernel_size=(1, 5, 5), stride=1, padding=(0, 2, 2))
     calibrated_mse = []
@@ -303,6 +303,21 @@ def _demo() -> None:
         xq, _ = calibrated.compress_decompress(smooth, q)
         calibrated_mse.append(float((xq - smooth).square().mean()))
     assert calibrated_mse[0] > calibrated_mse[-1], calibrated_mse
+    # THE CHECK THAT WAS MISSING, AND IT VOIDED A 10h RUN (D10). Monotonicity
+    # above is satisfied by a completely destroyed picture, so the config once
+    # shipped step_coarse 3.0 / step_fine 1.0 -- JPEG-plausible in [0,255] units,
+    # 255x too coarse for planes in [0,1] -- and every quality ran at 9.7-19.2 dB
+    # against real x264's 31.4-21.5 dB over QP30..50. The analyzer was at chance
+    # on every training frame, so L_task carried no gradient at all.
+    # The proxy stands in for QP30..50, so its FINEST quality must beat the
+    # WORST real quality it substitutes for (x264 QP50 ~= 21.5 dB at 128x128).
+    fine_psnr = -10.0 * math.log10(max(calibrated_mse[-1], 1e-12))
+    coarse_psnr = -10.0 * math.log10(max(calibrated_mse[0], 1e-12))
+    assert fine_psnr > 24.0, (
+        f"finest quality only {fine_psnr:.1f} dB -- below real x264 QP50 (~21.5 dB); "
+        "the quantiser step is in [0,1] pixel units, not [0,255]")
+    assert coarse_psnr > 15.0, (
+        f"coarsest quality {coarse_psnr:.1f} dB is below the recognition floor")
     # forward is differentiable and feeds gradient to its input
     xin = torch.rand(2, 3, 4, 32, 32, requires_grad=True)
     xh, bpp = cod(xin, 3)

@@ -196,6 +196,77 @@ trains damage" (teachers also negative) from "cross-backbone transfer failure" (
 positive, held-out r2plus1d_18 negative). Nothing in the screen can separate them: it discards
 `src_ok` and every number in it is post-codec and held-out-analyzer only.
 
+## 5.2 CAUSE FOUND — D10 IS VOID, and the fault is the training proxy's quantiser step
+
+Two diagnostics ran after §5.1, both cheap, both decisive.
+
+**(a) No-codec diagnostic (`u6-d10-diag-r128`, 113 clips, all three backbones, clean input).**
+The edit damages the TEACHERS as badly as the held-out analyzer — r3d_18 +0.000/+0.009/−0.018/
+−0.186/−0.354/−0.531 and mc3_18 +0.018/−0.035/−0.080/−0.159/−0.372/−0.522 at s=0.02…1.0 against
+r2plus1d_18's −0.018/−0.035/−0.080/−0.212/−0.398/−0.602. **Cross-backbone transfer failure is
+killed**: at s ≤ 0.05 all three sit within ±2 clips of source, i.e. the edit helps nobody.
+
+**(b) Proxy-sanity kernel (`u6-d10-proxy-r128`), and it did not return either pre-registered
+branch.** Running the SAME `VirtualCodec` the model trained against, with the preprocessor OFF
+(s=0, exact identity), the analyzer is at CHANCE at every quality in the training grid:
+
+| arm | clean | QP30 | QP35 | QP40 | QP45 | QP50 |
+|---|---|---|---|---|---|---|
+| identity, r2plus1d_18 | 0.894 / CE 0.49 | 0.018 / 8.12 | 0.009 / 8.42 | 0.009 / 7.58 | 0.027 / 8.11 | 0.009 / 8.99 |
+| identity, r3d_18 | 0.752 / 0.93 | 0.018 / 8.43 | 0.009 / 8.85 | 0.009 / 8.48 | 0.009 / 8.09 | 0.009 / 7.82 |
+| identity, mc3_18 | 0.770 / 0.96 | 0.018 / 7.61 | 0.009 / 7.73 | 0.009 / 7.50 | 0.009 / 7.52 | 0.018 / 7.97 |
+
+So the question "does the residual help through the proxy?" is not answerable and not
+interesting: **the proxy destroys the video by itself.** 0.9–2.7% top-1 is chance on 400 classes,
+and every CE is 1.5–3.0 nats ABOVE ln(400)=5.991.
+
+**Root cause, measured (`u6_big4/proxy_calib.py`, `u6_big4/proxy_target.py`).** `VirtualCodec`
+codes planes in **[0,1]**, but `configs/additive_ar.yaml` shipped `step_coarse: 3.0,
+step_fine: 1.0` — JPEG-plausible numbers in **[0,255]** units, i.e. **255× too coarse**. An
+orthonormal 8×8 DCT puts DC at 8·mean ≈ 4 and nearly every AC coefficient below 0.5, so
+`round(coeff/1.0)` zeroes all AC and leaves the block mean on a 1/8 grid — 8 grey levels, blocks
+only. Measured against real x264 at the same geometry (3 clips, 128², 16 frames):
+
+| | q8→QP30 | q5→QP35 | q3→QP40 | q2→QP45 | q1→QP50 |
+|---|---|---|---|---|---|
+| real x264 | 31.44 dB | 28.85 | 26.32 | 23.70 | 21.52 |
+| proxy, SHIPPED 3.0/1.0 | **19.16** | 15.19 | 15.71 | 12.59 | **9.71** |
+| proxy, defaults 0.25/0.03 | 35.86 | 32.04 | 28.73 | 27.53 | 25.40 |
+
+The shipped proxy is **10.6–13.7 dB below real x264 at every mapped QP, and its FINEST setting
+(19.16 dB) is worse than x264's WORST (QP50, 21.52 dB)** — the whole training grid sat outside
+the range the round evaluates. That is the mechanical explanation of the training log: task CE
+ran 8.484 → 8.038 and never came within 2 nats of ln(400), because the analyzer was at chance on
+every frame the optimiser ever showed it, so **L_task carried no usable gradient at all**; 76% of
+the total loss drop was the `mu·L_D` term fitting a destroyed target. The gap being monotone
+negative in s, ≈0 at s=0.02, and equally bad on the teachers all follow: the residual is noise
+shaped by MSE against garbage, and scaling noise to nothing just returns the identity.
+
+**How it got through the gates.** `virtual_codec._demo()` asserted fidelity only on the class
+DEFAULT steps and checked the shipped calibration for **monotonicity alone**
+(`calibrated_mse[0] > calibrated_mse[-1]`) — which a completely destroyed picture satisfies. The
+motivation for the coarse steps is in the source comment at `_quant_rate`: an earlier rate form
+"bottomed out at ~0.77 bpp, pinning the proxy ~20× above the x264/x265 operating range". The step
+was coarsened to chase a realistic **bpp** with a rate model (parameter-free Gaussian) that
+under-counts bits, and that destroyed the **distortion** channel — the only channel this
+objective actually uses, since `beta=0.001` makes the rate term decorative by design (§3.2).
+
+**Fixes committed:**
+1. `configs/additive_ar.yaml` → `step_coarse: 0.25, step_fine: 0.03` (+2.4…+4.4 dB vs real x264
+   at the mapped QP; bpp lands 5–20× high, which is correct and irrelevant here — do NOT
+   re-coarsen the step to fix bpp, that is the mistake that voided this run).
+2. `virtual_codec._demo()` now asserts the finest quality beats real x264 QP50 (>24 dB) and the
+   coarsest stays above the recognition floor (>15 dB), naming the [0,1]-vs-[0,255] trap.
+3. `src/models/additive.py` zero-inits `to_rgb`, so the untrained model is EXACTLY the identity
+   (verified `max|dx| = 0`, params still 9,795, gradient still reaches `to_rgb`). Default init
+   started the residual at RMS 0.10–0.18, i.e. 15–20 dB from identity — a second, independent
+   handicap: the optimiser opened from a random repaint.
+
+**Status: D10 is VOID and must be rerun, not written up.** Nothing in it measures the additive
+mechanism, and §5.1's screen tables describe a model trained against an unrecognisable proxy.
+The r128/r224 screens and the no-codec diagnostic keep their value only as the audit trail that
+found this.
+
 ## 6. Outcome interpretations (decided in advance)
 
 **Pre-registered expectations (pinned BEFORE any number, per 2026-08-31 review):**
@@ -210,6 +281,10 @@ positive, held-out r2plus1d_18 negative). Nothing in the screen can separate the
   9.42M (962×). At this size, 6.5k steps most likely converge — so a flat D10 result does
   NOT close the additive branch; it opens the capacity question (arm B / width becomes the
   next experiment, not a retraction of the mechanism).
+  **WRONG, and §5.2 says why: D10 was flat because its training proxy was 10–14 dB below the
+  codec it stands in for, so no capacity would have helped — a wider model fits the destroyed
+  target better, which is the disease, not the cure. Arm B is NOT the next experiment; the rerun
+  at the fixed calibration is. Do not read D10's flatness as a capacity datapoint.**
 
 Verdicts:
 
