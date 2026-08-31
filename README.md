@@ -3,6 +3,66 @@
 **Tiền xử lý video phổ quát, không phụ thuộc analyzer, cho VCM (Video Coding for
 Machines), đặt trước một codec chuẩn *đóng băng* (x264 / x265).**
 
+> ## English summary — status first
+>
+> A universal, analyzer-agnostic video preprocessor for Video Coding for Machines,
+> placed in front of a **frozen** standard codec (x264/x265). Only the small
+> preprocessor is trained: no bitstream change, no decoder change, no per-CTU QP
+> map. The optimised quantity is the preprocessor's gain on the *same* codec,
+> `BD-Rate(prep+x264 vs x264)` and `BD-Rate(prep+x265 vs x265)`, on the accuracy
+> axis (Kinetics-400 top-1), with a **held-out** analyzer never used in training.
+>
+> **Honest state: the publication target is not met, and one half of it is now
+> provably out of reach by this mechanism.** Target was BD ≤ −8% on *both* codecs
+> with the accuracy-gap rule passing (`prep − anchor ≥ −0.05` at every QP).
+>
+> | | measured, canonical protocol (n=1159, held-out `r2plus1d_18`, QP 30–50) |
+> |---|---|
+> | best variant passing the gap rule | `t_base` **−3.41%** h264 [CI95 −5.67, −1.24], −0.26% h265 |
+> | only variant beating −8% | `tdup6` −8.18% h264 — but fails the gap rule by 3.5× (−0.176) |
+> | certification arithmetic | CI ≈ ±3 pp at n=1159, so *claiming* ≤ −8% requires **measuring ≤ −11%** |
+>
+> **Three findings that are the actual contribution, negative or not:**
+>
+> 1. **R-D neutrality, stated as an exchange rate.** BD-rate asks one question:
+>    does the preprocessor buy accuracy more cheaply than the encoder's own QP
+>    knob? Measured accuracy-per-%bit: the learned edit beats the knob in **1 of
+>    10 cells** — h265 QP50, 1.33×, where top-1 is 0.07→0.22 and the task is
+>    already broken. At h264 QP30 the edit is *negative*: +73% bits to **lose**
+>    accuracy. Independently confirmed from the opposite direction by a
+>    Zhao-style enhancement filter (+10% bits, +3.3 pp accuracy, BD ≈ 0): moving
+>    along the trade in *either* direction buys nothing.
+> 2. **A measured ceiling: accuracy is no longer the bottleneck, bit cost is.**
+>    Holding the measured accuracy fixed and scaling the edit's bit cost to k× its
+>    real value, the additive round's existing gain prices at **−19.76% (h264)** and
+>    **−10.49% (h265)** with a *free* residual. h264 is therefore past the −11%
+>    bar on accuracy alone. **h265 tops out at −10.49% at zero bit cost**, so
+>    "−8% on both codecs" is **arithmetically unreachable** at this accuracy level.
+> 3. **The protocol, not the mechanism, explains the literature.** Rerunning one
+>    screen with a single config line changed (held-out `r2plus1d_18` → the
+>    training teacher `r3d_18`) flips h264 BD from positive to **negative** at
+>    small edit strengths, because the per-QP gap distribution flips (8/10
+>    non-negative cells on the teacher vs 3/10 held-out). Reported preprocessing
+>    gains of −12.3…−19.6% are **per-backbone, on-teacher** numbers; the bar used
+>    here — both codecs, held-out analyzer, gap rule — is **stricter than the
+>    literature's own claim**. (The magnitude of the flip is not quotable: n=113,
+>    non-monotone in strength. The systematic sign reversal is the finding.)
+>
+> **In flight:** a 3-point sweep of the objective's TV penalty (`loss.gamma`,
+> which had always been 0.0 — the objective never asked for a *cheap* residual).
+> Thresholds were pre-registered before the data existed. Even a full pass there
+> lands near −3.8%, so it tests whether the accuracy/cost trade exists at all; it
+> does not reach the target.
+>
+> **Reproduction:** canonical split fingerprint `30f083f8520a` (train 8636 / val
+> 1010 / test 1159, `rohanmallick/kinetics-train-5per`), real x264/x265 via
+> ffmpeg at preset medium, QP {30,35,40,45,50}. `pytest` → 45 tests.
+> **A number missing any one validity condition is a diagnostic, not a result** —
+> that boundary is enforced throughout this document.
+>
+> *The body below is in Vietnamese.* Design and pre-registration:
+> `docs/RUN_DESIGN_additive.md`.
+
 Chỉ một mạng tiền xử lý nhỏ được huấn luyện. Codec và mọi mô hình thị giác phía
 sau ("analyzer") giữ nguyên, đúng chuẩn — không sửa bitstream, không sửa decoder,
 không bản đồ QP theo CTU. Bộ tiền xử lý sửa pixel *trước khi* encode, sao cho ở
