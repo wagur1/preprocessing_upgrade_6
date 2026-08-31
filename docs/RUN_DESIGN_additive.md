@@ -118,11 +118,14 @@ Checkpoint delivery to eval kernels: push `best` checkpoint as a small Kaggle da
 ## 5. Pre-registered selection rule (Phase 2 → 3)
 
 The model is unconditioned, so the bit operating point is a single global strength
-`x_pre(s) = x + s·Δ(x)`. Screen grid (extended per 2026-08-31 review — it must bracket
-Δbpp=0 on BOTH sides): **s ∈ {0.1, 0.25, 0.5, 0.75, 1.0, 1.5}**. s=0.1 is mandatory: if
-Δbpp > 0 even at 0.25, a grid starting there can only report "no valid operating point".
-s=1.5 is cheap insurance for the opposite branch. On the 120-clip screen (per resolution,
-128 AND 224):
+`x_pre(s) = x + s·Δ(x)`. Screen grid (revised 2026-08-31 **after measuring the trained
+checkpoint but BEFORE any screen number existed** — see the note below): **s ∈ {0.02, 0.05,
+0.1, 0.25, 0.5, 1.0}**. The grid must bracket Δbpp=0 on both sides, and the measurement says
+the crossing is BELOW 0.1, not above 1.0: s=0.02 reproduces best.pt's own edit magnitude and
+is mandatory; s=1.0 is kept only as the trained reference point. The previous grid
+{0.1 … 1.5} is superseded — s=1.5 was insurance for an UNDER-scaled residual, a branch the
+measurement kills. Arm count is unchanged (6), so the screen still fits one session per
+resolution. On the 120-clip screen (per resolution, 128 AND 224):
 
 1. **Selection is by THRESHOLD, not argmin BD** (pick_s.py, pre-registered):
    `s* = max{ s : gap(s) ≥ −0.03 at every QP, both codecs AND Δbpp(s) ≤ 0 at every QP,
@@ -132,16 +135,31 @@ s=1.5 is cheap insurance for the opposite branch. On the 120-clip screen (per re
    but a one-parameter MONOTONE family is threshold-searchable at n=120, and Δbpp at fixed
    QP contains no analyzer at all. BD is deliberately NOT computed by the selector.
 2. If the selector prints "no operating point satisfies the rule": **do NOT conclude the
-   mechanism failed** — extend the grid DOWN (s < 0.1) first; the mu-cap analysis says the
-   likely failure mode is an over-expensive edit, which lives at small s.
+   mechanism failed** — extend the grid DOWN (s < 0.02) first; the measurement below says the
+   failure mode is an over-expensive edit, which lives at small s.
 3. Run Phase 3 ONCE per resolution at that resolution's s\*. (A second point s\*±0.25 is
    allowed only if quota ≥ 30h remains.)
 
-Note on the objective (2026-08-31 review correction): mu=10 is a LOOSE CAP, not a pin —
-with residual RMS ~0.013, 10·MSE ≈ 1.7e-3 against CE ≈ 1.0, and the |dL_task/de| > 20e
-boundary sits at e ≈ 0.19, far beyond any edit we want. Consequence: the realistic risk is
-NOT a timid (near-identity) edit but an over-bit-expensive one — which is exactly what the
-two-sided screen grid and the Δbpp ≤ 0 selector rule are built to catch.
+**Objective note, superseding the 2026-08-31 mu-cap arithmetic.** The direction of that
+correction was right and is now confirmed by measurement, but its numbers were taken from
+best.pt and do not describe THIS checkpoint. Measured on the D10 checkpoint (epoch 5 /
+step 5395, `u6_big4/edit_size.py`, before Phase 2 was pushed):
+
+| s | residual RMS | edit PSNR | pixels hitting the [0,1] clamp |
+|------|------|---------|------|
+| 0.10 | 0.053 | 25.6 dB | 3.8% |
+| 0.25 | 0.110 | 19.2 dB | 11.5% |
+| 0.50 | 0.174 | 15.2 dB | 25.1% |
+| 1.00 | 0.245 | **12.2 dB** | 44.6% |
+
+So mu=10 did not merely fail to pin the edit — the edit ran to **19× best.pt's magnitude**
+(0.245 vs 0.013 RMS; 12.2 dB vs 37.7 dB), with nearly half of all pixels saturating the
+output clamp. At s=1 this is not a prefilter, it is a repaint. best.pt's edit magnitude is
+reproduced at **s ≈ 0.025**, which is what fixes the bottom of the grid. Total variation on
+smooth synthetic input rises 22% even at s=0.1 (read as direction only — the synthetic
+baseline TV is artificially low, so real video will scale less), i.e. the edit ADDS structure
+to encode. Expect Δbpp > 0 across most of the grid; the whole selector exists to find where,
+or whether, it crosses zero.
 
 ## 6. Outcome interpretations (decided in advance)
 
@@ -168,8 +186,13 @@ Verdicts:
   **read as a capacity datapoint, not a mechanism refutation** (see above); the
   neutrality/boundary-condition paper gets its capstone — write it.
 - **Δbpp(s=1) far worse than the additive run's (+14.8%→+4%)** → the virtual-codec distortion
-  channel pushed the edit the wrong way; diagnostic before any retrain: compare edit statistics
-  (PSNR, TV) against best.pt's (37.7 dB).
+  channel pushed the edit the wrong way. **This diagnostic has ALREADY fired, before Phase 2
+  returned any bpp**: the edit statistics in §5 put D10 at 12.2 dB against best.pt's 37.7 dB.
+  So a large positive Δbpp at s=1 is now the EXPECTED reading, not a surprise, and it is not
+  by itself evidence against the mechanism — it is evidence that the useful operating point is
+  s ≈ 0.02–0.05. What would count against the mechanism is Δbpp > 0 at *every* grid point, or
+  gap collapsing to ≤ −0.03 at the s where Δbpp finally turns negative (i.e. the accuracy gain
+  is NOT separable from its bit cost — the one genuinely open question this screen answers).
 
 ## 7. Risks & mitigations
 
