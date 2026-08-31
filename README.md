@@ -62,6 +62,23 @@ Machines), đặt trước một codec chuẩn *đóng băng* (x264 / x265).**
 > the data existed; note that even a full pass lands near −3.8%, so it tests whether
 > the accuracy/cost trade exists at all — it does not reach the target.
 >
+> **Cross-validated against an independent implementation.** A teammate reimplemented
+> the same paper's preprocessor from scratch (`munnn01/proxy_v3`, read at source level
+> with permission). The two agree on everything the checkpoint cannot pin — module tree
+> 3→16 / 16→16→16 / 24→16 / 32→16→16 / 16→3, sigmoid gate with convex blend
+> `gate*sp + (1−gate)*tp`, zero-init output projection, clamp to [0,1] — which is what
+> made the single disagreement worth acting on: our temporal branch stacked the clip's
+> centre 8 frames ONCE and broadcast the result to every frame, so it contributed a
+> per-clip constant and the residual could not follow motion. It is now a causal window
+> ending at the current frame. Independently, their rate penalty carries a temporal
+> difference our total variation lacked — so our bit-cost proxy had been blind to the
+> inter-frame residual, which is where a video codec spends most of its bits. Both are
+> fixed and pinned by tests; parameter count is unchanged (9,795). Deliberately NOT
+> adopted: their straight-through codec bridge is byte-identical to ours, whose gradient
+> is `∂bpp_proxy/∂θ` exactly and has now failed in five places; and their
+> outside-the-analyzer-crop rate lever does not apply here, because this analyzer
+> resizes to 112 rather than centre-cropping, so there is no invisible region.
+>
 > **Reproduction:** canonical split fingerprint `30f083f8520a` (train 8636 / val
 > 1010 / test 1159, `rohanmallick/kinetics-train-5per`), real x264/x265 via
 > ffmpeg at preset medium, QP {30,35,40,45,50}. `pytest` → 45 tests.
@@ -155,6 +172,31 @@ sửa: top-1 0.009→0.336–0.850) và demo `virtual_codec`, **không phải**
 được sửa. Train lại đã **xong** (6 epoch, 2h24m, best epoch 5) và đã định giá:
 gap dương thật ở QP45/50 nhưng BD dương ở 12/12 arm — xem
 `Desktop/vcm-additive-2026-08-31.txt`.
+
+**Đối chiếu với một implementation độc lập (31/08).** Teammate dựng lại preprocessor
+của cùng paper từ đầu (`munnn01/proxy_v3`, đọc ở cấp source, có phép). Hai bên trùng
+nhau ở **mọi** thứ mà checkpoint không chốt được — cây module `3→16 / 16→16→16 /
+24→16 / 32→16→16 / 16→3`, sigmoid gate với convex blend `gate*sp + (1−gate)*tp`,
+zero-init `to_rgb`, clamp [0,1] — chính vì thế **một** điểm bất đồng mới đáng tin.
+Điểm đó: nhánh thời gian của ta xếp 8 frame **giữa** clip **một lần** rồi broadcast
+ra mọi frame, nên nó đóng góp một **hằng số theo clip** và residual không thể theo
+chuyển động (với clip 16 frame, edit áp lên frame 0 tính từ frame 4–11). Nay là cửa
+sổ **causal** kết thúc tại frame hiện tại. Việc này chốt 1 trong 4 switch wiring mà
+`docs/RUN_DESIGN_additive.md §2` ghi là không xác định được từ checkpoint.
+
+Độc lập với đó, hạng rate của họ có **hiệu theo thời gian** mà `total_variation` của
+ta thiếu — nên proxy chi phí bit của ta **mù với residual liên khung**, đúng chỗ codec
+video tiêu phần lớn bit. Cả hai đã sửa và có test chốt; số tham số không đổi (9.795)
+nên `best.pt` vẫn strict-load.
+
+**Cố ý không lấy:** STE bridge của họ (`standard_codec.py:664-666`) byte-identical với
+`src/models/ste_codec.py:78-79` của ta — `∂bpp/∂θ = ∂bpp_proxy/∂θ` chính xác, đã chết
+ở 5 chỗ. Đòn "rate ngoài crop analyzer" không áp dụng được ở đây: analyzer của ta
+**resize** về 112 (`src/tasks/action_recognition.py:81-91`) chứ không center-crop, nên
+không tồn tại vùng vô hình. Còn proxy distill từ codec thật (`train_proxy.py`: L1 với
+recon thật đã cache + smooth-L1 với bpp đo được) là đường **duy nhất chưa thử** —
+nhưng cache của họ chỉ chứa codec chạy trên clip **gốc** trong khi proxy đóng băng,
+nên cần giải quyết distribution shift trước khi port.
 
 Ba kết luận của vòng này, vì chúng đổi cách đọc cả dự án:
 
@@ -485,7 +527,8 @@ src/
     action_recognition.py  phân loại video Kinetics-400 (r3d_18/mc3_18/r2plus1d_18)
     tracking.py, siamfc.py, pytracking_adapter.py  task tracking GOT-10k
   codecs/standard.py   x264/x265 thật qua ffmpeg (bpp coded trung thực)
-  losses.py            L_task + ω·L_distill + β·bpp + τ·L_temp (+ δ,γ có mask) (+ μ·L_D)
+  losses.py            L_task + ω·L_distill + β·bpp + τ·L_temp (+ δ,γ có mask)
+                       (+ γ_res·TV(x_pre−x)) (+ μ·L_D) — TV gồm cả hiệu thời gian
   metrics/bd_rate.py   BD-Rate/BD-accuracy Bjøntegaard trên đường cong rate–accuracy
   engine.py            vòng train / eval, điều kiện hoá rate, BD-Rate 6 pipeline
 configs/
@@ -497,7 +540,7 @@ docs/
   bao_cao_preprocessing.md báo cáo tiếng Việt của vòng trước
   MODEL.md, IMPROVEMENTS.md, KAGGLE.md
 kaggle/   notebook Kaggle chạy ngay + launcher
-tests/    45 unit test, gồm self-check gate/smooth/entropy/additive
+tests/    51 unit test, gồm self-check gate/smooth/entropy/additive/residual-TV
 ```
 
 Phần lớn module không tầm thường có self-check `__main__` (8 module: `virtual_codec`,
