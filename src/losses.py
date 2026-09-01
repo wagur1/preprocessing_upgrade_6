@@ -1,7 +1,8 @@
 """Training objective for the machine-vision video preprocessor (upgrade2).
 
     L = lam_task * L_task + omega * L_distill + beta * L_rate + tau * L_temp
-        (+ delta * L_delta) (+ gamma * L_tv) (+ gamma_res * L_tv_res) (+ mu * L_D)
+        (+ delta * L_delta) (+ gamma * L_tv) (+ gamma_res * L_tv_res)
+        (+ kappa * L_dct) (+ mu * L_D)
 
 By default there is **no MSE-to-source distortion term**. That term (the
 baseline's ``L_D``) pins the reconstruction to the original pixels; against a
@@ -46,6 +47,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict
 
+import math
+
 import torch
 import torch.nn.functional as F
 
@@ -59,6 +62,7 @@ class LossWeights:
     delta: float = 0.0   # L1 edit-magnitude |x_pre-x| (edit sparsity; 0 = off)
     gamma: float = 0.0   # total-variation of x_pre (codec-agnostic bit cost; 0 = off)
     gamma_res: float = 0.0  # total-variation of the RESIDUAL x_pre-x (0 = off)
+    kappa: float = 0.0      # RPP adaptive-DCT rate proxy on x_pre (0 = off)
     mu: float = 0.0      # MSE-to-source L_D (paper's distortion term; 0 = off)
     use_task_mask: bool = False  # A2: weight gamma/delta by task saliency (spatial)
 
@@ -83,6 +87,56 @@ def total_variation(x: torch.Tensor) -> torch.Tensor:
         tv = tv + (x[:, :, 1:] - x[:, :, :-1]).abs().mean()
     return tv
 
+
+
+def _dct_basis(n: int, device, dtype) -> torch.Tensor:
+    """Orthogonal-ish 2D-DCT-II basis row matrix ``[n, n]`` (RPP's Eq. 1 form)."""
+    k = torch.arange(n, device=device, dtype=dtype)
+    return torch.cos(k[:, None] * math.pi / n * (k[None, :] + 0.5))
+
+
+def adaptive_dct_loss(x: torch.Tensor, block: int = 8, band: float = 0.5) -> torch.Tensor:
+    """RPP-style adaptive DCT loss: zero the WEAK high-frequency coefficients only.
+
+    Adapted from Rate-Perception Optimized Preprocessing (arXiv:2301.10455), which
+    reports 16.27% mean bitrate saving on FROZEN x264/x265/x266 -- and, unusually,
+    a LARGER saving on h265 than h264 (24.6% vs 18.2% VMAF), i.e. the opposite of
+    the per-codec asymmetry every subtractive mechanism in this repo has hit.
+
+    Why this is not `gamma`/`gamma_res` again. Total variation penalises ALL
+    variation with equal weight, so the only move it leaves the model is to shrink
+    the edit uniformly -- measured: a 10x sweep of `gamma_res` mapped monotonically
+    onto amplitude (equivalent to strength 0.46 / 0.15 / 0.03) and improved the
+    spectrum by a flat 3% at matched amplitude. This term is selective in TWO ways
+    instead:
+      * a ZigZag band mask protects LOW frequencies absolutely (weight 0), and
+      * within the high band, an adaptive threshold T = mean|F| protects the STRONG
+        coefficients (edges, contrast) and drives only the sub-mean ones to zero.
+    So it removes the detail a codec pays for and a recogniser plausibly does not,
+    rather than attenuating everything the model produces.
+
+    ``x`` is the value whose bits you want to reduce -- pass ``x_pre`` (the output),
+    NOT the residual: reducing rate BELOW the anchor requires removing source
+    detail, and a residual-only penalty can never remove any.
+    """
+    if x.ndim == 5:                                    # [B,C,T,H,W] -> [B*T,C,H,W]
+        x = x.permute(0, 2, 1, 3, 4).flatten(0, 1)
+    h, w = x.shape[-2:]
+    h, w = h - h % block, w - w % block
+    if h < block or w < block:
+        return x.new_zeros(())
+    blk = (x[..., :h, :w]
+           .unfold(-2, block, block).unfold(-2, block, block)  # [...,nH,nW,b,b]
+           .reshape(-1, block, block))
+    B = _dct_basis(block, x.device, x.dtype)
+    freq = B @ blk @ B.transpose(0, 1)                  # 2D DCT per block
+    idx = torch.arange(block, device=x.device)
+    band_mask = (idx[:, None] + idx[None, :]) >= max(1, int(round(band * 2 * (block - 1))))
+    sel = freq.abs() * band_mask                        # low frequencies -> exactly 0
+    n_sel = band_mask.sum().clamp_min(1)
+    thr = sel.sum(dim=(-2, -1), keepdim=True) / n_sel   # adaptive, per block
+    weak = band_mask & (sel < thr)                      # strong HF is PROTECTED
+    return (sel * weak).sum() / (blk.shape[0] * n_sel)
 
 
 def feature_distillation(analyzer, x_source: torch.Tensor, x_hat: torch.Tensor) -> torch.Tensor:
@@ -175,6 +229,16 @@ def preprocessing_loss(
         total = total + w.gamma_res * l_tv_res
     else:
         l_tv_res = x_hat.new_zeros(())
+    # RPP-style adaptive DCT rate proxy on the OUTPUT. Unlike gamma/gamma_res this
+    # can push rate BELOW the anchor, because it removes weak high-frequency detail
+    # of the source rather than only shaping what the model adds. Blocks 8 and 16 --
+    # the macroblock sizes a real codec transforms on (arXiv:2301.10455).
+    if w.kappa and x_pre is not None:
+        l_dct = 0.5 * (adaptive_dct_loss(x_pre, block=8)
+                       + adaptive_dct_loss(x_pre, block=16))
+        total = total + w.kappa * l_dct
+    else:
+        l_dct = x_hat.new_zeros(())
     # MSE-to-source L_D (Zhao et al.): pins the reconstruction to the source.
     # We dropped it originally because it fought compression -- but that was
     # against a mismatched (wavelet) proxy. The paper KEEPS it heavy (alpha=10)
@@ -194,5 +258,6 @@ def preprocessing_loss(
         "loss_delta": l_delta.detach(),
         "loss_tv": l_tv.detach(),
         "loss_tv_res": l_tv_res.detach(),
+        "loss_dct": l_dct.detach(),
         "loss_d": l_d.detach(),
     }
