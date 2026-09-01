@@ -32,12 +32,18 @@ Machines), đặt trước một codec chuẩn *đóng băng* (x264 / x265).**
 >    accuracy. Independently confirmed from the opposite direction by a
 >    Zhao-style enhancement filter (+10% bits, +3.3 pp accuracy, BD ≈ 0): moving
 >    along the trade in *either* direction buys nothing.
-> 2. **A measured ceiling: accuracy is no longer the bottleneck, bit cost is.**
->    Holding the measured accuracy fixed and scaling the edit's bit cost to k× its
->    real value, the additive round's existing gain prices at **−19.76% (h264)** and
->    **−10.49% (h265)** with a *free* residual. h264 is therefore past the −11%
->    bar on accuracy alone. **h265 tops out at −10.49% at zero bit cost**, so
->    "−8% on both codecs" is **arithmetically unreachable** at this accuracy level.
+> 2. **A measured ceiling — recomputed on certified data, and the earlier reading is
+>    RETRACTED.** Holding measured accuracy fixed and scaling the edit's bit cost to
+>    k× its real value: at *zero* bit cost the additive family prices at **−11.81%
+>    (h264)** and **−9.47% (h265)**. An earlier version of this section put those at
+>    −19.76% / −10.49% and concluded "−8% on both codecs is arithmetically
+>    unreachable"; that was computed on a 113-clip screen with a checkpoint trained
+>    under a broken temporal branch, and both inputs have since been fixed and
+>    measured on the canonical 1159-clip set. The correct statement is the opposite:
+>    holding bit cost as measured, the accuracy gap needs only **×1.55** to reach
+>    −8% on BOTH codecs (×1.75 h264 / ×1.85 h265 for −11%). Neither lever alone
+>    suffices — zeroing cost caps h265 at −9.47%, short of the −11% bar — so cost
+>    and accuracy must both move.
 > 3. **The protocol, not the mechanism, explains the literature.** Rerunning one
 >    screen with a single config line changed (held-out `r2plus1d_18` → the
 >    training teacher `r3d_18`) flips h264 BD from positive to **negative** at
@@ -127,6 +133,7 @@ Mọi con số phía dưới trong lịch sử D-series được đo trên **207
 | `g224` | cờ encoder theo từng codec, `frame_size` 224 | −0.65% [−3.81, +2.32] | −0.84% | FAIL (−0.072) |
 | `r96` | resample vòng về 96² | +8.54% [+5.57, +11.60] | +8.69% | FAIL (−0.144) |
 | `lo_s7` | s=0.7 phẳng trên lưới QP20–40 | +9.28% [+2.70, +15.06] | +5.62% | FAIL (−0.066) |
+| **`f4gr0` s=0.25** | **residual cộng**, nhánh thời gian causal (`f4e5f05`) | −1.31% [−3.53, +1.16] | **−2.79% [−4.61, −0.96]** | **PASS, gap DƯƠNG mọi QP** |
 
 **Luật gap** (quy tắc tuyển chọn xuyên suốt): chênh lệch độ chính xác
 `prep − anchor` phải **≥ −0.05 tại mọi QP** trên cả hai codec. Vi phạm là bị loại,
@@ -134,6 +141,17 @@ BD-rate đẹp cỡ nào cũng không cứu.
 
 **Chưa biến thể nào đạt mục tiêu công bố** (BD ≤ −8% trên *cả hai* codec, gap PASS).
 Cái vượt −8% duy nhất — `tdup6` — hỏng gap gấp 3.5 lần luật.
+
+**Hai cái lần đầu, do `f4gr0` (2026-09-01).** (1) CI của h265 **không chứa 0**
+([−4.61, −0.96], P(BD<0)=1.000) — số âm có ý nghĩa thống kê đầu tiên trên h265 kèm
+gap PASS. (2) Gap **dương thật ở mọi QP trên cả hai codec** (+0.015…+0.064 h264,
++0.028…+0.079 h265), không chỉ trên sàn −0.05. Và **tỉ lệ per-codec bị đảo**:
+h265/h264 = 2.13, trong khi mọi cơ chế *trừ bớt* cho 0.03–0.08 — **h265 không còn
+là codec chặn của họ additive, h264 mới là** (CI của h264 vẫn chứa 0). Đây là một
+**đánh đổi**, không phải cải thiện toàn diện: h264 xấu hơn `t_base`. Hướng là
+*enhancement* (Δbpp dương ở mọi QP, +2…+18%), cùng phía với Zhao-reference và
+`film_deeper3d` — khác hai cái đó, nó âm có ý nghĩa, nên nó **hạn định** phát biểu
+trung hoà R-D chứ không phủ định: −2.79% nằm ở rìa âm của dải ±3%.
 
 **Số học để chứng nhận:** với n=1159, CI ≈ ±3 điểm phần trăm, nên muốn *claim*
 ≤ −8% thì phải **đo được ≤ −11%**. Đây là ngưỡng thật, không phải −8%.
@@ -294,7 +312,7 @@ phải lưới QP** — điều này cũng khai tử luôn đề xuất "lưới
 | chroma | **đóng** | bỏ chroma **hoàn toàn** chỉ tiết kiệm 3–6% bitstream |
 | cấu hình encoder theo codec | **đóng** | `g224` BD ≈ 0, gap h264 FAIL |
 | hình học 224 + bỏ octave trên cùng | **đóng** | `g224` / `r96`; analyzer resize về 112 nên octave trên vô hình, nhưng bỏ nó vẫn không thắng |
-| **residual cộng (additive, gap ≥ 0)** | **đã định giá, CHƯA đóng** | gap dương thật (+0.195 @QP45 h264, boot5% +0.124) — lần đầu trong cả dự án; nhưng BD **dương ở 12/12 arm**. Chưa đóng vì hạng chi phí bit chưa từng có trong objective (`gamma: 0.0`), sweep `gamma` đang chạy |
+| **residual cộng (additive, gap ≥ 0)** | **MỞ — trục duy nhất có số âm chứng nhận trên h265** | `f4gr0` s=0.25: h265 **−2.79% [−4.61, −0.96]**, h264 −1.31%, gap dương mọi QP, 1159 clip. Chưa đạt −8%; cần gap ×1.55. Lever chi phí bit còn ~10 điểm (h264) / ~6.7 điểm (h265) headroom |
 
 Một kết quả âm trong dòng phân bổ rate đáng giữ lại: **bản đồ saliency có mang
 thông tin thật**. Bảo vệ *nửa sai* số block (cùng số lượng, mask lật ngược) làm mất
