@@ -145,12 +145,23 @@ def adaptive_dct3d_loss(x: torch.Tensor, tblock: int = 4, sblock: int = 8,
     """Adaptive DCT on SPATIO-TEMPORAL blocks: the axis ``adaptive_dct_loss`` cannot see.
 
     ``adaptive_dct_loss`` flattens time into the batch, so it is structurally blind to
-    temporal frequency. Measured consequence: as the spatial penalty tightened, the
-    model moved cost onto the temporal axis instead of paying it -- added spatial HF
-    fell +24.2% -> +6.9% while TVt/RMS rose 0.4931 -> 0.6964. The same evasion was
-    measured independently on ``gamma_res`` (temporal share 37.2% -> 42.8%). This term
-    closes that escape route, and an inter-frame residual is where a video codec
-    actually spends most of its bits.
+    temporal frequency, and an inter-frame residual is where a video codec actually
+    spends most of its bits. This term sees that axis.
+
+    RETRACTION, 2026-09-03 -- read this before tuning ``kappa_t``. The term was built
+    on "as the spatial penalty tightened the model moved cost onto the temporal axis
+    (TVt/RMS 0.4931 -> 0.6964)". A Parseval-exact block-DCT energy audit
+    (``u6_big4/spectrum3d.py``) does NOT support that: temporal-AC share of the
+    residual FALLS with kappa (18.9% -> 15.1% at tblock=16) and absolute temporal-AC
+    energy falls 66.3 -> 28.2 (x1e-5). TVt/RMS is an L1/L2 shape ratio, not an energy
+    share -- its rise came from a shrinking denominator. What IS real: the model adds
+    temporal-AC energy where this mask does not look. At kappa=10, added energy vs
+    source is +127.6% in spatial-LF temporal-AC against +43.2% in the penalised
+    spatial-HF cell, and only 20.6% of the added temporal-AC energy sits inside the
+    ``band=0.5`` band (57.1% is at v+w 4-6). Widening to ``band=0.0`` raises the loss
+    only +35%, because ``T = mean|F|`` protects above-mean coefficients and the escape
+    cell's coefficients are above-mean. So v1 prices the wrong cell, and a v2 needs the
+    band AND the threshold changed, not just a larger ``kappa_t``.
 
     Band mask (coefficient address ``(u, v, w)`` = temporal, spatial_h, spatial_w):
 

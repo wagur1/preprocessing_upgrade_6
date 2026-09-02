@@ -1,9 +1,12 @@
 """Checks for the 3-D (spatio-temporal) adaptive DCT term (`kappa_t`, src/losses.py).
 
 The 2-D term flattens time into the batch, so it is structurally blind to temporal
-frequency, and the model was measured escaping into exactly that axis: added spatial
-HF fell +24.2% -> +6.9% under kappa while TVt/RMS ROSE 0.4931 -> 0.6964. The same
-evasion appeared independently on gamma_res (temporal share 37.2% -> 42.8%).
+frequency. The escape-route framing that motivated this term was RETRACTED on
+2026-09-03 (see the losses.py docstring): TVt/RMS is an L1/L2 shape ratio, not an
+energy share, and the residual's temporal-AC energy share actually falls with kappa.
+What survives is narrower and still worth a term: the model adds temporal-AC energy
+mostly OUTSIDE this mask's band (+127.6% spatial-LF vs +43.2% spatial-HF at kappa=10),
+so these tests pin the transform's correctness, not the v1 band's usefulness.
 
 Note on the spec these tests implement: "alternating-sign residual -> penalty
 maximal" is only true for residuals that also carry SPATIAL high frequency. A

@@ -261,14 +261,23 @@ nên cần giải quyết distribution shift trước khi port.
 
 Ba kết luận của vòng này, vì chúng đổi cách đọc cả dự án:
 
-**(1) Phép biên tập thua chính núm QP của encoder.** BD-rate thực chất chỉ hỏi
-một câu: bộ tiền xử lý mua accuracy có rẻ hơn cách đơn giản là hạ QP không? Đo
-accuracy trên mỗi %bit (`u6_big4/accperbit.py`, cùng 113 clip screen): phép biên
-tập thắng núm QP ở **1/10 ô** duy nhất (h265 QP50, 1.33×, mà ở đó accuracy chỉ
-0.07→0.22 — task đã vỡ). Ở h264 QP45 nó **kém núm 1.26×**; ở h264 QP30 nó **âm**
-(−0.00061 so với +0.00181 của núm) — trả +73% bit để *mất* accuracy. Đây là cách
-phát biểu mạnh nhất của kết quả âm: trung hoà R-D viết thành một tỉ giá
-núm-vs-biên-tập trực tiếp.
+**(1) Phép biên tập thua chính núm QP của encoder — nhưng CHỈ ở checkpoint
+6-epoch; đã bị đảo ở checkpoint hội tụ.** BD-rate thực chất chỉ hỏi một câu: bộ
+tiền xử lý mua accuracy có rẻ hơn cách đơn giản là hạ QP không? Đo accuracy trên
+mỗi %bit (`u6_big4/accperbit.py`, cùng 113 clip screen), **checkpoint 6-epoch**:
+phép biên tập thắng núm QP ở **1/10 ô** duy nhất (h265 QP50, 1.33×, mà ở đó
+accuracy chỉ 0.07→0.22 — task đã vỡ); ở h264 QP45 nó **kém núm 1.26×**, ở h264
+QP30 nó **âm** (−0.00061 so với +0.00181 của núm) — trả +73% bit để *mất*
+accuracy.
+
+**Đính chính (2026-09-02):** con số 1/10 là thuộc tính của một checkpoint bị cắt
+schedule, không phải của cơ chế. `kappa=10 @16ep` (project best, h264 −3.42%
+[−5.88, −0.88] / h265 −2.63% [−4.49, −0.79], gap dương ở mọi QP) **thắng núm QP ở
+8/8 ô so sánh được**, tỉ giá 1.07×–2.86×. Phát biểu đúng bây giờ: trung hoà R-D
+là tỉ giá *mặc định*, và nó bị phá khi và chỉ khi phần biên tập được huấn luyện
+đủ dài **và** chi phí bit bị một penalty phổ giữ lại — hai lever tách rời và cộng
+tính (schedule cấp accuracy nhưng một mình làm BD xấu vì bit tăng nhanh hơn 2.5×;
+`kappa` giữ bit lại: Δbpp@QP30 h264 18.3% → 23.8% → **14.2%**).
 
 **(2) Accuracy KHÔNG còn là điểm nghẽn — chi phí bit mới là.** Giữ accuracy đo
 được cố định rồi ép chi phí bit về k lần mức thật (`u6_big4/ceiling.py`): phần
