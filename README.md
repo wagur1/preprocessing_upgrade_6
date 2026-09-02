@@ -44,6 +44,18 @@ Machines), đặt trước một codec chuẩn *đóng băng* (x264 / x265).**
 >    −8% on BOTH codecs (×1.75 h264 / ×1.85 h265 for −11%). Neither lever alone
 >    suffices — zeroing cost caps h265 at −9.47%, short of the −11% bar — so cost
 >    and accuracy must both move.
+> 2b. **Current best, and the first variant significant on BOTH codecs**
+>    (`kappa=10` at 16 epochs, 1159 clips, held-out analyzer, gap positive at every
+>    QP): **h264 −3.42% [−5.88, −0.88]** and **h265 −2.63% [−4.49, −0.79]**, both CIs
+>    excluding zero. It works because two levers are separable: a longer schedule
+>    supplies accuracy but raises bits 2.5x faster (schedule length alone made BD
+>    WORSE), while an RPP-style adaptive DCT penalty (arXiv:2301.10455) restrains the
+>    bits — the only penalty here that reshapes the residual's SPECTRUM rather than
+>    shrinking its amplitude. Known leak: that DCT is per-frame, so the model evades
+>    into the temporal axis; the same evasion was measured on the earlier TV penalty,
+>    which makes "constrain one axis and cost moves to an unconstrained one" a
+>    twice-measured property rather than an anecdote. Still short of the −8% target,
+>    which needs ≤ −11% measured.
 > 3. **The protocol, not the mechanism, explains the literature.** Rerunning one
 >    screen with a single config line changed (held-out `r2plus1d_18` → the
 >    training teacher `r3d_18`) flips h264 BD from positive to **negative** at
@@ -133,7 +145,8 @@ Mọi con số phía dưới trong lịch sử D-series được đo trên **207
 | `g224` | cờ encoder theo từng codec, `frame_size` 224 | −0.65% [−3.81, +2.32] | −0.84% | FAIL (−0.072) |
 | `r96` | resample vòng về 96² | +8.54% [+5.57, +11.60] | +8.69% | FAIL (−0.144) |
 | `lo_s7` | s=0.7 phẳng trên lưới QP20–40 | +9.28% [+2.70, +15.06] | +5.62% | FAIL (−0.066) |
-| **`f4gr0` s=0.25** | **residual cộng**, nhánh thời gian causal (`f4e5f05`) | −1.31% [−3.53, +1.16] | **−2.79% [−4.61, −0.96]** | **PASS, gap DƯƠNG mọi QP** |
+| `f4gr0` s=0.25 | residual cộng, nhánh thời gian causal (`f4e5f05`) | −1.31% [−3.53, +1.16] | **−2.79% [−4.61, −0.96]** | PASS, gap dương mọi QP |
+| **`kappa10-16ep` s=0.25** | **như trên + hạng DCT `kappa=10`, 16 epoch** (`70cd452`) | **−3.42% [−5.88, −0.88]** | **−2.63% [−4.49, −0.79]** | **PASS, gap dương mọi QP** |
 
 **Luật gap** (quy tắc tuyển chọn xuyên suốt): chênh lệch độ chính xác
 `prep − anchor` phải **≥ −0.05 tại mọi QP** trên cả hai codec. Vi phạm là bị loại,
@@ -141,6 +154,36 @@ BD-rate đẹp cỡ nào cũng không cứu.
 
 **Chưa biến thể nào đạt mục tiêu công bố** (BD ≤ −8% trên *cả hai* codec, gap PASS).
 Cái vượt −8% duy nhất — `tdup6` — hỏng gap gấp 3.5 lần luật.
+
+**KẾT QUẢ TỐT NHẤT HIỆN TẠI — `kappa10-16ep` (2026-09-02): biến thể ĐẦU TIÊN có ý
+nghĩa thống kê trên CẢ HAI codec.** h264 −3.42% [−5.88, −0.88] (P(BD<0)=0.996) và
+h265 −2.63% [−4.49, −0.79] (P=1.000), cả hai CI không chứa 0, gap **dương ở mọi QP**
+trên cả hai. Trước đó `t_base` chỉ significant ở h264 (h265 −0.26%) và `f4gr0` chỉ ở
+h265 (h264 CI trùm 0). Vẫn **chưa đạt** mục tiêu −8% (cần đo ≤ −11%).
+
+**Hai lever tách rời và cộng dồn — đây là điều làm nó chạy:**
+1. **Lịch học dài cấp ACCURACY, không cấp BD.** Một biến, 6→20 epoch: accuracy tăng
+   ở **10/10** ô, nhưng bit tăng nhanh **gấp 2.5 lần** accuracy, nên BD **xấu đi**
+   (h264 −1.31% → −0.99%). Đừng dùng số epoch như một lever BD.
+2. **`kappa` (adaptive DCT kiểu RPP, arXiv:2301.10455) kìm BIT.** Δbpp@QP30 h264:
+   18.3% (6ep) → 23.8% (20ep) → **14.2%** (kappa=10 @16ep) mà accuracy vẫn giữ. Đây
+   là hạng phạt **duy nhất** trong repo nặn lại *phổ* của residual thay vì bóp *biên
+   độ*: RMS 0.05075 → 0.04386 trong khi năng lượng HF thêm vào giảm +24.2% → +6.9%.
+
+**Chỗ rò đã đo, và là bước tiếp theo:** `kappa` là DCT theo khối **trên từng frame**,
+thuần không gian — model lách sang trục thời gian (`TVt/RMS` 0.4931 → 0.6964 khi lịch
+dài ra). Y hệt cách `gamma_res` bị lách (t-share 37.2% → 42.8%). **Chặn một trục thì
+model dồn chi phí sang trục chưa chặn — đo được hai lần, trên hai hạng phạt độc lập.**
+Bản sửa là DCT khối **3-D** thay vì từng frame.
+
+**Mọi run learned của dự án đều bị cắt lịch học.** `epochs: 6` sinh ra từ một comment
+ước `~90 min/epoch` khi thực tế là **23**. Best epoch đo được: additive **17/20**,
+kappa=10 **14/16**, và D1/D2 **vẫn đang cải thiện ở epoch 13** khi Kaggle kill ở giới
+hạn 12h/session. Nên mọi kết luận "học thất bại" trong sổ trục đều rút ra ở khoảng
+1/3 lịch học khả dụng.
+
+**Điểm vận hành đã chốt: s=0.25.** `s=0.02` cho −0.10%/−0.52% (CI trùm 0) — gần
+identity, BD → 0 đúng như phải vậy, và đó là sanity check cho kết quả ở s=0.25.
 
 **Hai cái lần đầu, do `f4gr0` (2026-09-01).** (1) CI của h265 **không chứa 0**
 ([−4.61, −0.96], P(BD<0)=1.000) — số âm có ý nghĩa thống kê đầu tiên trên h265 kèm
@@ -312,7 +355,7 @@ phải lưới QP** — điều này cũng khai tử luôn đề xuất "lưới
 | chroma | **đóng** | bỏ chroma **hoàn toàn** chỉ tiết kiệm 3–6% bitstream |
 | cấu hình encoder theo codec | **đóng** | `g224` BD ≈ 0, gap h264 FAIL |
 | hình học 224 + bỏ octave trên cùng | **đóng** | `g224` / `r96`; analyzer resize về 112 nên octave trên vô hình, nhưng bỏ nó vẫn không thắng |
-| **residual cộng (additive, gap ≥ 0)** | **MỞ — trục duy nhất có số âm chứng nhận trên h265** | `f4gr0` s=0.25: h265 **−2.79% [−4.61, −0.96]**, h264 −1.31%, gap dương mọi QP, 1159 clip. Chưa đạt −8%; cần gap ×1.55. Lever chi phí bit còn ~10 điểm (h264) / ~6.7 điểm (h265) headroom |
+| **residual cộng (additive, gap ≥ 0)** | **MỞ — trục duy nhất có số âm chứng nhận trên CẢ HAI codec** | `kappa10-16ep` s=0.25: h264 **−3.42% [−5.88, −0.88]**, h265 **−2.63% [−4.49, −0.79]**, gap dương mọi QP, 1159 clip. Chưa đạt −8%; cần gap ×1.55. Bước tiếp: `kappa` phiên bản DCT 3-D để chặn cả trục thời gian |
 
 Một kết quả âm trong dòng phân bổ rate đáng giữ lại: **bản đồ saliency có mang
 thông tin thật**. Bảo vệ *nửa sai* số block (cùng số lượng, mask lật ngược) làm mất
@@ -546,7 +589,8 @@ src/
     tracking.py, siamfc.py, pytracking_adapter.py  task tracking GOT-10k
   codecs/standard.py   x264/x265 thật qua ffmpeg (bpp coded trung thực)
   losses.py            L_task + ω·L_distill + β·bpp + τ·L_temp (+ δ,γ có mask)
-                       (+ γ_res·TV(x_pre−x)) (+ μ·L_D) — TV gồm cả hiệu thời gian
+                       (+ γ_res·TV(x_pre−x)) (+ κ·L_dct) (+ μ·L_D)
+                       TV gồm cả hiệu thời gian; L_dct = adaptive DCT kiểu RPP
   metrics/bd_rate.py   BD-Rate/BD-accuracy Bjøntegaard trên đường cong rate–accuracy
   engine.py            vòng train / eval, điều kiện hoá rate, BD-Rate 6 pipeline
 configs/
@@ -558,7 +602,7 @@ docs/
   bao_cao_preprocessing.md báo cáo tiếng Việt của vòng trước
   MODEL.md, IMPROVEMENTS.md, KAGGLE.md
 kaggle/   notebook Kaggle chạy ngay + launcher
-tests/    51 unit test, gồm self-check gate/smooth/entropy/additive/residual-TV
+tests/    62 unit test, gồm self-check gate/smooth/entropy/additive/residual-TV
 ```
 
 Phần lớn module không tầm thường có self-check `__main__` (8 module: `virtual_codec`,
