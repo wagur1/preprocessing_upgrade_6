@@ -83,6 +83,11 @@ loss:                     # L = lam_task*L_task + mu*L_D + beta*bpp  (Zhao form)
                           # coefficients are pushed to zero. Unlike gamma/gamma_res
                           # this can push rate BELOW the anchor. L_dct ~ 0.058 vs
                           # L_task ~ 3.3, so biting range is 1-10; <=0.1 decorative.
+  kappa_t: 0.0            # RPP-style adaptive DCT on SPATIO-TEMPORAL blocks (8x8x4).
+                          # Additive to kappa, which is per-frame and therefore blind
+                          # to the axis the model was measured escaping into (added
+                          # spatial HF +24.2%->+6.9% while TVt/RMS rose 0.49->0.70).
+                          # L_dct3d ~ 0.0095 vs L_task ~ 3.3 -> biting range 35-70.
   gamma_res: 0.0          # TV of the RESIDUAL x_pre-x. This is the bit-cost
                           # lever for an additive edit. Size it against L_task
                           # (~3.3): TV(res) ~ 6e-3, so <1 is decorative, >=10 bites.

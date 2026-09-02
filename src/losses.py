@@ -2,7 +2,7 @@
 
     L = lam_task * L_task + omega * L_distill + beta * L_rate + tau * L_temp
         (+ delta * L_delta) (+ gamma * L_tv) (+ gamma_res * L_tv_res)
-        (+ kappa * L_dct) (+ mu * L_D)
+        (+ kappa * L_dct) (+ kappa_t * L_dct3d) (+ mu * L_D)
 
 By default there is **no MSE-to-source distortion term**. That term (the
 baseline's ``L_D``) pins the reconstruction to the original pixels; against a
@@ -62,7 +62,8 @@ class LossWeights:
     delta: float = 0.0   # L1 edit-magnitude |x_pre-x| (edit sparsity; 0 = off)
     gamma: float = 0.0   # total-variation of x_pre (codec-agnostic bit cost; 0 = off)
     gamma_res: float = 0.0  # total-variation of the RESIDUAL x_pre-x (0 = off)
-    kappa: float = 0.0      # RPP adaptive-DCT rate proxy on x_pre (0 = off)
+    kappa: float = 0.0      # RPP adaptive-DCT rate proxy on x_pre, PER-FRAME (0 = off)
+    kappa_t: float = 0.0    # same, on SPATIO-TEMPORAL blocks (0 = off); additive to kappa
     mu: float = 0.0      # MSE-to-source L_D (paper's distortion term; 0 = off)
     use_task_mask: bool = False  # A2: weight gamma/delta by task saliency (spatial)
 
@@ -136,6 +137,62 @@ def adaptive_dct_loss(x: torch.Tensor, block: int = 8, band: float = 0.5) -> tor
     n_sel = band_mask.sum().clamp_min(1)
     thr = sel.sum(dim=(-2, -1), keepdim=True) / n_sel   # adaptive, per block
     weak = band_mask & (sel < thr)                      # strong HF is PROTECTED
+    return (sel * weak).sum() / (blk.shape[0] * n_sel)
+
+
+def adaptive_dct3d_loss(x: torch.Tensor, tblock: int = 4, sblock: int = 8,
+                        band: float = 0.5) -> torch.Tensor:
+    """Adaptive DCT on SPATIO-TEMPORAL blocks: the axis ``adaptive_dct_loss`` cannot see.
+
+    ``adaptive_dct_loss`` flattens time into the batch, so it is structurally blind to
+    temporal frequency. Measured consequence: as the spatial penalty tightened, the
+    model moved cost onto the temporal axis instead of paying it -- added spatial HF
+    fell +24.2% -> +6.9% while TVt/RMS rose 0.4931 -> 0.6964. The same evasion was
+    measured independently on ``gamma_res`` (temporal share 37.2% -> 42.8%). This term
+    closes that escape route, and an inter-frame residual is where a video codec
+    actually spends most of its bits.
+
+    Band mask (coefficient address ``(u, v, w)`` = temporal, spatial_h, spatial_w):
+
+    * ``u == 0`` -- temporal DC, i.e. content that is static across the block. Weight
+      ZERO: inter prediction codes it almost free, so penalising it would fight real
+      content rather than waste.
+    * ``u >= 1`` and ``v + w`` below the spatial band -- spatial-LF flicker. Weight
+      ZERO, a deliberate scope hole in v1; measure that cell's energy before widening.
+    * ``u >= 1`` and ``v + w`` in the spatial-HF band -- flickery texture. PENALISED.
+    * inside the band, ``|F| >= T`` with per-block ``T = mean|F|`` -- protected, so
+      motion-following edits survive. Same strong-coefficient rule as the 2-D term.
+
+    The basis is the ORTHONORMAL one from ``virtual_codec`` (``D @ D.T == I``), not the
+    unnormalised helper used by the 2-D term: this transform mixes a 4-long temporal
+    axis with 8-long spatial axes, and unequal per-axis scaling would make ``|F|``
+    incomparable across axes and skew the adaptive threshold.
+    """
+    from .models.virtual_codec import _dct_basis as _ortho_basis
+
+    if x.ndim != 5:
+        raise ValueError(f"adaptive_dct3d_loss expects [B,C,T,H,W], got {tuple(x.shape)}")
+    t_, h, w = x.shape[2], x.shape[-2], x.shape[-1]
+    t_, h, w = t_ - t_ % tblock, h - h % sblock, w - w % sblock
+    if t_ < tblock or h < sblock or w < sblock:
+        return x.new_zeros(())
+    b, c = x.shape[0], x.shape[1]
+    blk = (x[:, :, :t_, :h, :w]
+           .reshape(b, c, t_ // tblock, tblock, h // sblock, sblock, w // sblock, sblock)
+           .permute(0, 1, 2, 4, 6, 3, 5, 7)          # [B,C,nT,nH,nW, t,s,s]
+           .reshape(-1, tblock, sblock, sblock))
+    Dt = _ortho_basis(tblock).to(x)
+    Ds = _ortho_basis(sblock).to(x)
+    freq = torch.einsum("ntij,ut,vi,wj->nuvw", blk, Dt, Ds, Ds)
+
+    u = torch.arange(tblock, device=x.device)
+    s = torch.arange(sblock, device=x.device)
+    spatial_hf = (s[:, None] + s[None, :]) >= max(1, int(round(band * 2 * (sblock - 1))))
+    mask = (u[:, None, None] >= 1) & spatial_hf[None, :, :]
+    sel = freq.abs() * mask
+    n_sel = mask.sum().clamp_min(1)
+    thr = sel.sum(dim=(-3, -2, -1), keepdim=True) / n_sel      # adaptive, per block
+    weak = mask & (sel < thr)
     return (sel * weak).sum() / (blk.shape[0] * n_sel)
 
 
@@ -239,6 +296,13 @@ def preprocessing_loss(
         total = total + w.kappa * l_dct
     else:
         l_dct = x_hat.new_zeros(())
+    # Spatio-temporal sibling of kappa. ADDITIVE, not a replacement: kappa stays at
+    # its measured peak (10) so any delta is attributable to the temporal axis alone.
+    if w.kappa_t and x_pre is not None:
+        l_dct3d = adaptive_dct3d_loss(x_pre)
+        total = total + w.kappa_t * l_dct3d
+    else:
+        l_dct3d = x_hat.new_zeros(())
     # MSE-to-source L_D (Zhao et al.): pins the reconstruction to the source.
     # We dropped it originally because it fought compression -- but that was
     # against a mismatched (wavelet) proxy. The paper KEEPS it heavy (alpha=10)
@@ -259,5 +323,6 @@ def preprocessing_loss(
         "loss_tv": l_tv.detach(),
         "loss_tv_res": l_tv_res.detach(),
         "loss_dct": l_dct.detach(),
+        "loss_dct3d": l_dct3d.detach(),
         "loss_d": l_d.detach(),
     }
