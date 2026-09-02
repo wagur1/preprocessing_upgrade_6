@@ -13,6 +13,21 @@ def load_config(path: str) -> dict:
 
 
 def _coerce(v: str) -> Any:
+    """Coerce a CLI override value. Bracketed values become LISTS.
+
+    List support matters because several load-bearing keys are lists
+    (``task.teachers``, ``eval.qp_list``) and without it they could only be
+    changed by editing the YAML, which changes every run that shares the file.
+    Bare tokens are accepted so no quoting survives the
+    bash -> notebook -> shell layers: ``task.teachers=[r3d_18]`` works, and so do
+    ``[r3d_18,mc3_18]``, ``["r3d_18"]`` and ``[30,35,40]``. An empty ``[]`` is an
+    empty list, not the string.
+    """
+    if len(v) >= 2 and v[0] == "[" and v[-1] == "]":
+        inner = v[1:-1].strip()
+        if not inner:
+            return []
+        return [_coerce(x.strip().strip("\"'")) for x in inner.split(",")]
     for cast in (int, float):
         try:
             return cast(v)
