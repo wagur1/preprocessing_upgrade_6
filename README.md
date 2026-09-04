@@ -12,73 +12,91 @@ Machines), đặt trước một codec chuẩn *đóng băng* (x264 / x265).**
 > `BD-Rate(prep+x264 vs x264)` and `BD-Rate(prep+x265 vs x265)`, on the accuracy
 > axis (Kinetics-400 top-1), with a **held-out** analyzer never used in training.
 >
-> **Honest state: the publication target is not met, and one half of it is now
-> provably out of reach by this mechanism.** Target was BD ≤ −8% on *both* codecs
-> with the accuracy-gap rule passing (`prep − anchor ≥ −0.05` at every QP).
+> **Honest state: the −8% publication target is not met, and the number-chasing
+> track is CLOSED on measured evidence — the project's main line is now the
+> reposition battery (universality + statistical hardening), with the −2.5%
+> headline positioned as the first rigorous measurement of this niche.**
+> Target was BD ≤ −8% on *both* codecs with the accuracy-gap rule passing
+> (`prep − anchor ≥ −0.05` at every QP).
 >
 > | | measured, canonical protocol (n=1159, held-out `r2plus1d_18`, QP 30–50) |
 > |---|---|
-> | best variant passing the gap rule | `t_base` **−3.41%** h264 [CI95 −5.67, −1.24], −0.26% h265 |
-> | only variant beating −8% | `tdup6` −8.18% h264 — but fails the gap rule by 3.5× (−0.176) |
+> | best variant passing the gap rule | `kappa=10 @16ep` **−3.42%** h264 [CI95 −5.88, −0.88], **−2.63%** h265 [−4.49, −0.79] |
+> | replication (seed 1) | h264 **−2.52%** [−4.92, +0.16] (CI spans 0), h265 **−2.33%** [−4.14, −0.57] (significant HELD) |
+> | quoting rule (cross-review Q1) | report **min/max/n**, never a mean; **h265 leads the headline** (significant in both runs, flat across the kappa sweep) |
 > | certification arithmetic | CI ≈ ±3 pp at n=1159, so *claiming* ≤ −8% requires **measuring ≤ −11%** |
 >
-> **Three findings that are the actual contribution, negative or not:**
+> **Four findings that are the actual contribution, negative or not:**
 >
-> 1. **R-D neutrality, stated as an exchange rate.** BD-rate asks one question:
->    does the preprocessor buy accuracy more cheaply than the encoder's own QP
->    knob? Measured accuracy-per-%bit: the learned edit beats the knob in **1 of
->    10 cells** — h265 QP50, 1.33×, where top-1 is 0.07→0.22 and the task is
->    already broken. At h264 QP30 the edit is *negative*: +73% bits to **lose**
->    accuracy. Independently confirmed from the opposite direction by a
->    Zhao-style enhancement filter (+10% bits, +3.3 pp accuracy, BD ≈ 0): moving
->    along the trade in *either* direction buys nothing.
-> 2. **A measured ceiling — recomputed on certified data, and the earlier reading is
->    RETRACTED.** Holding measured accuracy fixed and scaling the edit's bit cost to
->    k× its real value: at *zero* bit cost the additive family prices at **−11.81%
->    (h264)** and **−9.47% (h265)**. An earlier version of this section put those at
->    −19.76% / −10.49% and concluded "−8% on both codecs is arithmetically
->    unreachable"; that was computed on a 113-clip screen with a checkpoint trained
->    under a broken temporal branch, and both inputs have since been fixed and
->    measured on the canonical 1159-clip set. The correct statement is the opposite:
->    holding bit cost as measured, the accuracy gap needs only **×1.55** to reach
->    −8% on BOTH codecs (×1.75 h264 / ×1.85 h265 for −11%). Neither lever alone
->    suffices — zeroing cost caps h265 at −9.47%, short of the −11% bar — so cost
->    and accuracy must both move.
-> 2b. **Current best, and the first variant significant on BOTH codecs**
->    (`kappa=10` at 16 epochs, 1159 clips, held-out analyzer, gap positive at every
->    QP): **h264 −3.42% [−5.88, −0.88]** and **h265 −2.63% [−4.49, −0.79]**, both CIs
->    excluding zero. It works because two levers are separable: a longer schedule
->    supplies accuracy but raises bits 2.5x faster (schedule length alone made BD
->    WORSE), while an RPP-style adaptive DCT penalty (arXiv:2301.10455) restrains the
->    bits — the only penalty here that reshapes the residual's SPECTRUM rather than
->    shrinking its amplitude. Known leak: that DCT is per-frame, so the model evades
->    into the temporal axis; the same evasion was measured on the earlier TV penalty,
->    which makes "constrain one axis and cost moves to an unconstrained one" a
->    twice-measured property rather than an anecdote. Still short of the −8% target,
->    which needs ≤ −11% measured.
-> 3. **The protocol, not the mechanism, explains the literature.** Rerunning one
->    screen with a single config line changed (held-out `r2plus1d_18` → the
->    training teacher `r3d_18`) flips h264 BD from positive to **negative** at
->    small edit strengths, because the per-QP gap distribution flips (8/10
->    non-negative cells on the teacher vs 3/10 held-out). Reported preprocessing
->    gains of −12.3…−19.6% are **per-backbone, on-teacher** numbers; the bar used
->    here — both codecs, held-out analyzer, gap rule — is **stricter than the
->    literature's own claim**. (The magnitude of the flip is not quotable: n=113,
->    non-monotone in strength. The systematic sign reversal is the finding.)
+> 1. **R-D neutrality, stated as an exchange rate — and where it breaks.** The
+>    6-epoch checkpoint beat the encoder's own QP knob in 1 of 10 cells; the
+>    16-epoch kappa=10 checkpoint **wins 8/8 comparable cells at 1.07×–2.86×**.
+>    The two separable levers: a long schedule supplies accuracy (10/10 cells)
+>    but raises bits 2.5× faster (BD worse alone), while the RPP-style adaptive
+>    DCT penalty (arXiv:2301.10455) restrains bits at held accuracy — the only
+>    penalty here that reshapes the residual's SPECTRUM rather than its
+>    amplitude. Protocol flips the sign: the same screen re-scored on the
+>    training teacher instead of the held-out analyzer turns BD positive →
+>    negative, which is why the literature's −12.3…−19.6% (per-backbone,
+>    on-teacher, no CI) is not comparable to this protocol.
+> 2. **A measured, lineage-corrected ceiling.** Holding measured accuracy fixed
+>    and scaling the edit's bit cost to k× its real value (`u6_big4/ceiling.py`,
+>    overlap window k-independent by construction): the kappa=10 lineage prices
+>    at **−11.89% (h264) / −8.03% (h265)** at zero bit cost (k=0.25 already
+>    gives −9.79/−6.69). Two earlier readings are retracted: the −19.76/−10.49
+>    numbers came from the broken-temporal-branch checkpoint on a 113-clip
+>    screen, and the published −9.47% h265 was the *f4gr0* lineage's ceiling,
+>    not kappa=10's. The "gap ×1.55 ⇒ −8% on both codecs" stack extrapolation
+>    is likewise RETIRED (cross-review C5: one-point linear extrapolation in a
+>    family whose only accuracy experiment ran backwards). Current honest
+>    statement: −8% needs k ≈ 0.45 (h264) to k ≈ 0.0 (h265) — the h265 margin
+>    is 0.03 pp under the most generous possible assumption, and no measured
+>    lever has entered the low-k region. The −8% target stays "alive" only in
+>    this arithmetic sense.
+> 3. **A complete, pre-registered falsification map (2026-09-02 → 09-04).**
+>    Every remaining accuracy/breadth lever was run with bands registered
+>    before launch, and every one landed in its registered downside or worse:
+>    `omega=1.0` feature distillation −1.55/−1.56 (teacher-overfit signature,
+>    as Liu et al. 1910.09185 predicted); `mu=3` freed-edit −2.12/−0.71
+>    (1-shard; bits rose faster than gap — Δbpp@QP30 +15.9/+13.9 vs kappa=10's
+>    +14.2/+11.5; real-clip edit RMS grew only +18%, so the mu axis is
+>    *dominated*, not saturated); `kappa_t=50` −1.85/−2.50 (aimed at the wrong
+>    cell — the 0-GPU Parseval-exact spectrum audit retracted the 3-D DCT
+>    round's premise BEFORE the run, commit 5dc7737); geometry @224 +0.01/+5.04
+>    (the analyzer's fixed 112 resize is a Nyquist wall for the 128-trained
+>    edit); `add224` retrain gate-failed (smoothing regime). The one axis never
+>    measured is *allocation* (QP-conditional / spatial), pre-registered as
+>    round (b) QP-conditioned FiLM (`docs/RUN_DESIGN_qpc.md`, commit 15283bd,
+>    cross-review-audited, NOT yet run) and a hard δ-cap (round c) — both
+>    queued BEHIND the reposition battery.
+> 4. **The reposition battery is the main line** (checklist:
+>    `Desktop/vcm-reposition-checklist-2026-09-04.md`): 6-backbone universality
+>    matrix (have r2plus1d/r3d/mc3; add i3d, SlowFast, MViT2), tracking via
+>    DiMP/PrDiMP, fine-tuned-analyzer baseline, VMAF row, third seed, s-grid
+>    {0.15, 0.25, 0.35} — all eval-only on the existing checkpoint except the
+>    seed run. Literature anchors per cross-review C8: the only published
+>    pre-only datapoint (Google's Sandwiched Compression, arXiv:2402.05887) is
+>    10–15% on HUMAN metrics (LPIPS) with 7.85M params, and the whole sandwich
+>    is ~5% on HEVC/PSNR — our −2.5% is *consistent with* that band; it is
+>    never quotable as "the niche's band" for machine metrics.
 >
-> **Latest:** the objective had never contained a real bit-cost term, so a sweep
-> of the TV penalty `loss.gamma` (0.01/0.03/0.1) was run — and came back a **null**:
-> all three checkpoints landed within 0.7% residual RMS of the `gamma=0` baseline.
-> Cause, measured: `gamma*TV(x_pre)` was 0.00–0.04% of the objective (TV ≈ 6e-3 vs
-> `L_task` ≈ 3.3), i.e. decorative, and the coefficient had been carried over from a
-> config written for a *subtractive* mechanism. `TV(x_pre)` is also the wrong target
-> for an additive edit: it is dominated by the source video's own texture, and
-> minimising it means blurring the source — the family already measured neutral.
-> Replaced by `gamma_res * TV(x_pre − x)`, which penalises only the spectrum of what
-> the model **adds** (`src/losses.py`, `tests/test_residual_tv.py`), swept at
-> coefficients sized against the task term. Thresholds were pre-registered before
-> the data existed; note that even a full pass lands near −3.8%, so it tests whether
-> the accuracy/cost trade exists at all — it does not reach the target.
+> **Latest (2026-09-04):** the number-chasing track closed with the mu=3
+> round (registered downside landed: 1-shard h264 −2.12 / h265 −0.71, bits
+> rose faster than gap at held gaps — the pre-registered failure family, not a
+> blow-up: gap rule PASS at every QP). A full-protocol replication of kappa=10
+> with seed 1 (`rep1`) exposed ~1 pp of re-run variance at the eval/codec
+> level (edit-level twin: same best epoch, RMS 0.0452 vs 0.0467), which
+> downgrades the h264 claim to "marginal-to-significant" and anchors the
+> min/max/n quoting rule. Round (b) — QP-conditioned additive edit, one
+> zero-init FiLM on the shared trunk (10,371 params, `71146d9`, design revised
+> per cross-review C7 at `15283bd`) — is implemented, unit-tested (suite
+> 80/80), pre-registered, and waiting on quota behind the reposition battery.
+> All results, per-QP data, and the k-scaling ceiling live in
+> `Desktop/vcm-results-2026-09-04.xlsx`; the narrative deck for non-experts is
+> `Desktop/vcm-bao-cao-tong-ket-2026-09-04.pptx` (Vietnamese). *(The gamma-null
+> report this paragraph replaces — TV penalty decorative at 0.00–0.04% of the
+> objective, `gamma_res` mapping onto amplitude — remains valid history and is
+> kept in the Vietnamese body below.)*
 >
 > **Cross-validated against an independent implementation.** A teammate reimplemented
 > the same paper's preprocessor from scratch (`munnn01/proxy_v3`, read at source level
@@ -99,7 +117,7 @@ Machines), đặt trước một codec chuẩn *đóng băng* (x264 / x265).**
 >
 > **Reproduction:** canonical split fingerprint `30f083f8520a` (train 8636 / val
 > 1010 / test 1159, `rohanmallick/kinetics-train-5per`), real x264/x265 via
-> ffmpeg at preset medium, QP {30,35,40,45,50}. `pytest` → 45 tests.
+> ffmpeg at preset medium, QP {30,35,40,45,50}. `pytest` → 80 tests.
 > **A number missing any one validity condition is a diagnostic, not a result** —
 > that boundary is enforced throughout this document.
 >
@@ -128,7 +146,54 @@ tiền xử lý giúp máy đạt cùng độ chính xác với ít bit hơn. (S
 
 ---
 
-## Trạng thái dự án (2026-08-31) — đọc mục này trước
+## Trạng thái dự án (2026-09-04) — đọc mục này trước
+
+**Headline trung thực (luật min/max/n theo phán quyết cross-review Q1):**
+`kappa=10 @16ep, s=0.25` — h264 **−3.42% [−5.88, −0.88]** / rep1 seed=1 **−2.52%
+[−4.92, +0.16]** (CI chạm 0); h265 **−2.63% [−4.49, −0.79]** / rep1 **−2.33%
+[−4.14, −0.57]** (cả 2 significant). **h265 dẫn headline** — significant ở cả 2
+lần chạy, phẳng qua toàn bộ kappa sweep (không exposure winner's-curse). Nhiễu
+lặp lại ~1pp sống ở tầng EVAL/codec, không phải train (twin edit-level: cùng best
+epoch, RMS 0.0452 vs 0.0467) → mọi so sánh dùng dung sai ±1pp.
+
+**Bản đồ falsification khép lại 2026-09-02 → 09-04 (mọi round đăng ký band TRƯỚC
+khi chạy, mọi round rơi đúng downside đã ghi):**
+
+| round | BD h264 / h265 | cơ chế chết |
+|---|---|---|
+| omega=1.0 (chưng cất đặc trưng) | −1.55 / −1.56 | teacher-overfit — đúng signature Liu 1910.09185 dự báo |
+| mu=3 (giải phóng edit) | −2.12* / −0.71* | bit tăng nhanh hơn gap (Δbpp@QP30 +15.9/+13.9); edit thật chỉ +18% RMS → trục mu bị *dominated*, không đóng |
+| kappa_t=50 (phạt thời gian) | −1.85 / −2.50 | nhắm sai cell — audit phổ Parseval 0-GPU retract premise TRƯỚC run (`5dc7737`) |
+| geometry @224 input | +0.01* / +5.04* | analyzer resize về crop 112 = tường Nyquist với edit train ở 128 |
+| add224 retrain | gate-fail | regime mượt hóa (vùng kappa=20/30) — không tốn eval |
+| 3-D DCT round | chưa chạy — retract | audit năng lượng: escape ở spatial-MID temporal-AC, sai cell |
+
+(* = 1-shard 554 clip, đọc hướng.) **Kết luận: track đuổi số ĐÓNG.** Giá trị còn
+lại = phép đo đầu tiên của niche + bản đồ cơ chế; **main line là battery
+reposition** (`Desktop/vcm-reposition-checklist-2026-09-04.md`): ma trận 6
+backbone, tracking DiMP/PrDiMP, baseline fine-tuned, VMAF, seed-3, s-grid.
+
+**Trần lý thuyết đã đính chính theo lineage (audit C5, `u6_big4/c5c_audit.py`):**
+kappa=10 → **−11.89% h264 / −8.03% h265** ở k=0 (miễn phí bit hoàn toàn); k=0.25
+→ −9.79/−6.69. Số cũ −9.47 (h265) là của dòng f4gr0, không phải kappa=10. Cửa sổ
+overlap k-independent by construction (đã kiểm bằng code) — artifact rd_neutral
+không thể xảy ra ở đây. Mục tiêu −8% "còn sống" duy nhất theo nghĩa số học: cần
+k ≈ 0.45 (h264) tới k ≈ 0.0 (h265); không lever đo được nào vào được vùng k thấp.
+Claim "gap ×1.55 ⇒ −8% cả hai codec" đã RETIRE (C5: ngoại suy 1 điểm).
+
+**Round (b) — QP-conditioned additive edit** (`docs/RUN_DESIGN_qpc.md`, commit
+`15283bd`): thêm MỘT zero-init FiLM trên trunk chung của editor (9.795 → 10.371
+params; best.pt strict-load phần base — có test chốt); premise đã bị Claude bắt
+sai lineage trong cross-review C7 và sửa bằng audit 0-GPU: gap/Δbpp lệch
+**4.1× (h264) tới 10.2× (h265)** giữa QP30 và QP tốt nhất — target reallocation
+tồn tại thật. Đăng ký band + gate hành vi (cond QP30 vs QP50 phải lệch > ±3% twin
+noise) + escalation b' (BD-weighted QP sampling chỉ nếu null-with-FiLM-used) +
+δ-cap là round (c). Cả hai xếp SAU battery.
+
+**Số liệu đầy đủ:** `Desktop/vcm-results-2026-09-04.xlsx` (12 run × 2 codec, CI,
+per-QP, k-scaling, gates — mọi số từ merge.py trên store Kaggle thật).
+
+## Trạng thái dự án (2026-08-31) — lịch sử, giữ nguyên để đối chiếu
 
 Mọi con số phía dưới trong lịch sử D-series được đo trên **207 clip**. Chúng đã
 được đo lại trên **1159 clip** với khoảng tin cậy ở mức clip, và kết luận đã đổi.
@@ -364,7 +429,7 @@ phải lưới QP** — điều này cũng khai tử luôn đề xuất "lưới
 | chroma | **đóng** | bỏ chroma **hoàn toàn** chỉ tiết kiệm 3–6% bitstream |
 | cấu hình encoder theo codec | **đóng** | `g224` BD ≈ 0, gap h264 FAIL |
 | hình học 224 + bỏ octave trên cùng | **đóng** | `g224` / `r96`; analyzer resize về 112 nên octave trên vô hình, nhưng bỏ nó vẫn không thắng |
-| **residual cộng (additive, gap ≥ 0)** | **MỞ — trục duy nhất có số âm chứng nhận trên CẢ HAI codec** | `kappa10-16ep` s=0.25: h264 **−3.42% [−5.88, −0.88]**, h265 **−2.63% [−4.49, −0.79]**, gap dương mọi QP, 1159 clip. Chưa đạt −8%; cần gap ×1.55. Bước tiếp: `kappa` phiên bản DCT 3-D để chặn cả trục thời gian |
+| **residual cộng (additive, gap ≥ 0)** | **MỞ — trục duy nhất có số âm chứng nhận trên CẢ HAI codec** | `kappa10-16ep` s=0.25: h264 **−3.42% [−5.88, −0.88]** / rep1 −2.52, h265 **−2.63% [−4.49, −0.79]** / rep1 −2.33, gap dương mọi QP, 1159 clip. Chưa đạt −8% (trần k=0: −11.89/−8.03, audit C5). Các lever phụ đã đóng: omega (teacher-overfit), mu=3 (bit-dominated), kappa_t (sai cell), 3-D DCT (retract pre-run `5dc7737`), @224 (Nyquist-112). Bước tiếp theo dòng chính: **battery reposition**; cơ chế còn duy nhất chưa đo: **allocation** — round (b) QP-FiLM (`15283bd`, pre-registered) + δ-cap (round c) |
 
 Một kết quả âm trong dòng phân bổ rate đáng giữ lại: **bản đồ saliency có mang
 thông tin thật**. Bảo vệ *nửa sai* số block (cùng số lượng, mask lật ngược) làm mất
