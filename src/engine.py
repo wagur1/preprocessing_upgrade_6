@@ -54,7 +54,14 @@ from .data import (
 )
 from .losses import LossWeights, preprocessing_loss
 from .metrics import aggregate_metrics, bd_metric, bd_rate, sequence_metrics
-from .models import AdditivePreprocessor, CompressAICodec, STECodec, VideoPreprocessor, VirtualCodec
+from .models import (
+    AdditiveCondPreprocessor,
+    AdditivePreprocessor,
+    CompressAICodec,
+    STECodec,
+    VideoPreprocessor,
+    VirtualCodec,
+)
 from .models.task_mask import task_saliency
 from .tasks import build_task
 from .tasks.base import build_analyzer
@@ -91,6 +98,15 @@ def _build_models(cfg: dict, device: torch.device, role: str = "train"):
         pre = AdditivePreprocessor(
             temporal_frames=int(m.get("temporal_frames", 8)),
             strength=float(m.get("strength", 1.0)),
+        ).to(device)
+    elif arch == "additive_cond":
+        # Round (b) (docs/RUN_DESIGN_qpc.md): same Zhao tree + zero-init FiLM
+        # on the shared trunk so the edit can condition on the rate operating
+        # point the engine already passes as ``cond``. 10,371 params.
+        pre = AdditiveCondPreprocessor(
+            temporal_frames=int(m.get("temporal_frames", 8)),
+            strength=float(m.get("strength", 1.0)),
+            cond_dim=int(m.get("cond_dim", 1)),
         ).to(device)
     elif arch == "unet":
         pre = VideoPreprocessor(
